@@ -101,3 +101,36 @@ class SubjectProgress(Base):
     hours = Column(Float, nullable=False)
     note = Column(String, nullable=True)
 
+
+# Mapping between Group, Teacher, and Subject for replacements/permissions
+class GroupTeacherSubject(Base):
+    __tablename__ = "group_teacher_subjects"
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=False, index=True)
+    teacher_id = Column(Integer, ForeignKey("teachers.id"), nullable=False, index=True)
+    subject_id = Column(Integer, ForeignKey("subjects.id"), nullable=False, index=True)
+
+
+# Day plan with approvals
+class DaySchedule(Base):
+    __tablename__ = "day_schedules"
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(Date, nullable=False, index=True)
+    status = Column(String, default="pending", nullable=False)
+    entries = relationship("DayScheduleEntry", back_populates="day_schedule", cascade="all, delete-orphan")
+
+
+class DayScheduleEntry(Base):
+    __tablename__ = "day_schedule_entries"
+    id = Column(Integer, primary_key=True, index=True)
+    day_schedule_id = Column(Integer, ForeignKey("day_schedules.id"), nullable=False, index=True)
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=False, index=True)
+    subject_id = Column(Integer, ForeignKey("subjects.id"), nullable=False, index=True)
+    teacher_id = Column(Integer, ForeignKey("teachers.id"), nullable=True, index=True)
+    room_id = Column(Integer, ForeignKey("rooms.id"), nullable=False, index=True)
+    start_time = Column(String, nullable=False)
+    end_time = Column(String, nullable=False)
+    status = Column(String, default="pending", nullable=False)  # pending/approved/replaced
+    schedule_item_id = Column(Integer, ForeignKey("schedule_items.id"), nullable=True, index=True)
+
+    day_schedule = relationship("DaySchedule", back_populates="entries")
