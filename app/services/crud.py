@@ -10,10 +10,14 @@ import pandas as pd
 from collections import defaultdict
 import random
 import logging
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-pair_duration = 1.5
+# Pair and hour semantics
+# Academic hour (AH) is a 45-minute unit. Excel provides total/weekly in AH.
+# One scheduled lesson slot ("pair") equals pair_size_ah academic hours (usually 2 AH).
+PAIR_SIZE_AH = settings.pair_size_academic_hours or 2
 
 # Store last planning debug notes keyed by DaySchedule.id
 _last_plan_debug: dict[int, list[str]] = {}
@@ -180,18 +184,38 @@ def _is_holiday(current_date: date, holidays: List[schemas.HolidayPeriod], holid
     return False
 
 
-def _distribute_hours(weekly_hours: float, week_type: str, is_even: bool) -> float:
-    if weekly_hours == 0:
-        return 0.0
-    half = weekly_hours / 2
-    week_type_enum = WeekType(week_type)
-    if week_type_enum == WeekType.balanced:
-        return weekly_hours
-    elif week_type_enum == WeekType.even_priority:
-        return max(half, weekly_hours - math.floor(half)) if is_even else math.floor(half)
-    elif week_type_enum == WeekType.odd_priority:
-        return math.floor(half) if is_even else max(half, weekly_hours - math.floor(half))
-    return weekly_hours
+def _pairs_for_week(weekly_ah: float, week_type: str, is_even: bool, pair_size_ah: int = PAIR_SIZE_AH) -> int:
+    """
+    Compute number of full pairs (int) to schedule this week based on weekly academic hours
+    and parity priority rules.
+
+    - For even values (e.g., 4, 6 AH), returns weekly_ah / pair_size_ah pairs every week.
+    - For odd totals (e.g., 5 AH), returns ceil(avg_pairs) on priority week and floor(avg_pairs) otherwise.
+    - For 1 AH with odd/even priority, yields 1 pair on priority weeks, 0 otherwise (average 0.5 pair/week).
+    """
+    if weekly_ah <= 0 or pair_size_ah <= 0:
+        return 0
+    avg_pairs = weekly_ah / float(pair_size_ah)
+    wt = WeekType(week_type)
+    if wt == WeekType.balanced:
+        return int(round(avg_pairs))
+    # priority splitting for non-integer avg
+    up = math.ceil(avg_pairs)
+    down = math.floor(avg_pairs)
+    if wt == WeekType.even_priority:
+        return up if is_even else down
+    if wt == WeekType.odd_priority:
+        return down if is_even else up
+    return int(round(avg_pairs))
+
+
+def _distribute_hours(weekly_ah: float, week_type: str, is_even: bool, pair_size_ah: int = PAIR_SIZE_AH) -> float:
+    """
+    Return the number of academic hours (AH) to allocate this week based on weekly_ah
+    and parity rules, aligned to whole pairs.
+    """
+    pairs = _pairs_for_week(weekly_ah, week_type, is_even, pair_size_ah)
+    return float(pairs * pair_size_ah)
 
 
 def _parse_course_from_group(name: str) -> int | None:
@@ -216,7 +240,7 @@ def _get_time_slots_for_group(group_name: str, enable_shifts: bool) -> List[Dict
 
 
 def _assign_daily_schedule(
-    weekly_hours: float,
+    weekly_ah: float,
     week_start: date,
     week_end: date,
     is_even: bool,
@@ -232,8 +256,9 @@ def _assign_daily_schedule(
     preferred_days: List[str] | None = None,
     concentrate_on_preferred_days: bool = False,
     enable_shifts: bool = True,
+    pair_size_ah: int = PAIR_SIZE_AH,
 ) -> List[dict]:
-    if weekly_hours == 0:
+    if weekly_ah <= 0:
         logger.debug(
             "No weekly hours for item id=%s group=%s subject=%s; skipping",
             schedule_item.id,
@@ -243,7 +268,7 @@ def _assign_daily_schedule(
         return []
     max_pairs_per_day = max(1, max_pairs_per_day)
     daily_schedule = []
-    remaining_hours = weekly_hours
+    remaining_ah = weekly_ah
     available_days = []
     for i in range((week_end - week_start).days + 1):
         current_date = week_start + timedelta(days=i)
@@ -261,7 +286,7 @@ def _assign_daily_schedule(
         return []
     if not preferred_days:
         random.shuffle(available_days)
-    pairs_needed = math.ceil(remaining_hours / pair_duration)
+    pairs_needed = math.ceil(remaining_ah / float(pair_size_ah))
     base_days = len(available_days)
     if concentrate_on_preferred_days and preferred_days:
         base_days = min(len(preferred_days), base_days)
@@ -269,23 +294,23 @@ def _assign_daily_schedule(
     group_day_counts = defaultdict(int)
     slots = _get_time_slots_for_group(schedule_item.group.name, enable_shifts)
     logger.debug(
-        "Assigning daily schedule: item_id=%s group=%s subject=%s hours=%.2f is_even=%s pairs/day<=%s shifts=%s",
+        "Assigning daily schedule: item_id=%s group=%s subject=%s weekly_ah=%.2f is_even=%s pairs/day<=%s shifts=%s",
         schedule_item.id,
         schedule_item.group.name,
         schedule_item.subject.name,
-        weekly_hours,
+        weekly_ah,
         is_even,
         max_pairs_per_day,
         enable_shifts,
     )
     for day_name, day_date in available_days:
-        if remaining_hours <= 0:
+        if remaining_ah <= 0:
             break
         pairs_assigned = 0
         local_slots = slots.copy()
         random.shuffle(local_slots)
         for slot in local_slots:
-            if pairs_assigned >= pairs_per_day or remaining_hours <= 0:
+            if pairs_assigned >= pairs_per_day or remaining_ah <= 0:
                 break
             teacher_key = (day_date, slot["start"], schedule_item.teacher_id)
             group_key = (day_date, slot["start"], schedule_item.group_id)
@@ -323,7 +348,7 @@ def _assign_daily_schedule(
             occupied_group.add(group_key)
             room_occupancy[room_key] += 1
             group_day_counts[(schedule_item.group_id, day_date)] += 1
-            remaining_hours -= pair_duration
+            remaining_ah -= pair_size_ah
             pairs_assigned += 1
             logger.debug("Assigned %s %s-%s", day_name, slot["start"], slot["end"])
     return daily_schedule
@@ -394,7 +419,9 @@ def fill_schedules(db: Session, gen_schedules: List[models.GeneratedSchedule], r
         logger.warning("No schedule items found for provided request")
         return
 
-    remaining_hours = {item.id: item.total_hours for item in all_items}
+    # Effective total hours (in academic hours). If Excel totals are annual, halve for semester.
+    divisor = 2 if (request.total_hours_is_annual if request.total_hours_is_annual is not None else settings.total_hours_is_annual) else 1
+    remaining_hours = {item.id: (item.total_hours / divisor) for item in all_items}
     room_occupancy = defaultdict(int)
     occupied_teacher = set()
     occupied_group = set()
@@ -427,7 +454,14 @@ def fill_schedules(db: Session, gen_schedules: List[models.GeneratedSchedule], r
 
     current_date = request.start_date
     while current_date <= request.end_date:
-        week_number = (current_date - date(2025, 9, 1)).days // 7
+        # Determine week parity base
+        base_str = request.parity_base_date.isoformat() if getattr(request, 'parity_base_date', None) else (settings.parity_base_date or "2025-09-01")
+        try:
+            base_y, base_m, base_d = [int(x) for x in base_str.split('-')]
+            base_date = date(base_y, base_m, base_d)
+        except Exception:
+            base_date = date(2025, 9, 1)
+        week_number = (current_date - base_date).days // 7
         is_even = (week_number % 2 == 0)
         week_end = min(current_date + timedelta(days=6 - current_date.weekday()), request.end_date)
         random.shuffle(all_items)
@@ -436,14 +470,23 @@ def fill_schedules(db: Session, gen_schedules: List[models.GeneratedSchedule], r
         for item in all_items:
             if remaining_hours[item.id] <= 0:
                 continue
-            weekly_hours = min(item.weekly_hours, remaining_hours[item.id])
-            hours = _distribute_hours(weekly_hours, item.week_type, is_even)
+            # Pair size may be overridden per request
+            pair_size_ah = request.pair_size_academic_hours or PAIR_SIZE_AH
+            weekly_ah = min(item.weekly_hours, remaining_hours[item.id])
+            hours = _distribute_hours(weekly_ah, item.week_type, is_even, pair_size_ah)
+            # Clamp to remaining (align to full pairs)
+            if hours > remaining_hours[item.id]:
+                # Reduce to the largest multiple of pair_size_ah not exceeding remaining
+                max_pairs = int(remaining_hours[item.id] // pair_size_ah)
+                hours = float(max_pairs * pair_size_ah)
+                if hours <= 0:
+                    continue
             logger.debug(
                 "Item id=%s group=%s subject=%s weekly=%.2f -> hours_this_week=%.2f remaining_before=%.2f",
                 item.id,
                 item.group.name,
                 item.subject.name,
-                weekly_hours,
+                item.weekly_hours,
                 hours,
                 remaining_hours[item.id],
             )
@@ -455,14 +498,15 @@ def fill_schedules(db: Session, gen_schedules: List[models.GeneratedSchedule], r
                 preferred_days=request.preferred_days,
                 concentrate_on_preferred_days=bool(request.concentrate_on_preferred_days),
                 enable_shifts=bool(request.enable_shifts),
+                pair_size_ah=pair_size_ah,
             )
             if daily_schedule:
-                actual_hours = len(daily_schedule) * pair_duration
-                remaining_hours[item.id] -= actual_hours
+                actual_ah = len(daily_schedule) * pair_size_ah
+                remaining_hours[item.id] -= actual_ah
                 logger.debug(
-                    "Planned %d slots (%.1f h) for item id=%s; remaining=%.1f",
+                    "Planned %d slots (%.1f AH) for item id=%s; remaining=%.1f",
                     len(daily_schedule),
-                    actual_hours,
+                    actual_ah,
                     item.id,
                     remaining_hours[item.id],
                 )
@@ -473,8 +517,8 @@ def fill_schedules(db: Session, gen_schedules: List[models.GeneratedSchedule], r
                     week_end=week_end,
                     is_even_week=1 if is_even else 0,
                     schedule_item_id=item.id,
-                    hours_even=weekly_hours if is_even else 0,
-                    hours_odd=weekly_hours if not is_even else 0,
+                    hours_even=hours if is_even else 0,
+                    hours_odd=hours if not is_even else 0,
                     daily_schedule=daily_schedule
                 )
                 distributions.append(dist)
@@ -544,7 +588,8 @@ def get_generated_schedule(db: Session, gen_id: int):
                     defaultdict(int),
                     set(),
                     set(),
-                    defaultdict(set)
+                    defaultdict(set),
+                    pair_size_ah=PAIR_SIZE_AH,
                 )
                 filtered_daily_schedule = d.daily_schedule
             if filtered_daily_schedule:
@@ -688,7 +733,7 @@ def calculate_assigned_hours(db: Session, schedule_item_id: int) -> schemas.Hour
         raise ValueError("Schedule item not found")
     dists = db.query(models.WeeklyDistribution).filter(models.WeeklyDistribution.schedule_item_id == schedule_item_id).all()
     assigned_pairs = sum(len(d.daily_schedule or []) for d in dists)
-    assigned_hours = assigned_pairs * pair_duration
+    assigned_hours = assigned_pairs * PAIR_SIZE_AH
     total_hours = item.total_hours
     remaining = max(0.0, total_hours - assigned_hours)
     return schemas.HoursResponse(assigned_hours=assigned_hours, total_hours=total_hours, remaining_hours=remaining)
@@ -1521,6 +1566,241 @@ def update_entry_manual(
     return {"entry_id": e.id, "old": prev, "new": new, "status": e.status, "report": report}
 
 
+def get_entry_replacement_options(
+    db: Session,
+    entry_id: int,
+    *,
+    limit_teachers: int | None = 20,
+    limit_rooms: int | None = 20,
+) -> Dict:
+    e = db.query(models.DayScheduleEntry).filter(models.DayScheduleEntry.id == entry_id).first()
+    if not e:
+        raise ValueError("Entry not found")
+    ds = db.query(models.DaySchedule).get(e.day_schedule_id)
+    if not ds:
+        raise ValueError("Day schedule not found")
+    group = db.query(models.Group).get(e.group_id)
+    subject = db.query(models.Subject).get(e.subject_id)
+    # Teachers: priority by mapping for (group, subject) -> (group, any subject) -> any free
+    teacher_opts: list[dict] = []
+    seen_teachers: set[int] = set()
+    # 1) Group-Subject mapping
+    mapped_same = (
+        db.query(models.GroupTeacherSubject)
+        .filter(models.GroupTeacherSubject.group_id == e.group_id, models.GroupTeacherSubject.subject_id == e.subject_id)
+        .all()
+    )
+    for l in mapped_same:
+        t = db.query(models.Teacher).get(l.teacher_id)
+        if not t or t.id in seen_teachers:
+            continue
+        if _teacher_is_free(db, t.id, ds.date, e.start_time, e.end_time, exclude_entry_id=e.id):
+            teacher_opts.append({"teacher_name": t.name, "source": "group_subject_mapping"})
+            seen_teachers.add(t.id)
+            if limit_teachers and len(teacher_opts) >= limit_teachers:
+                break
+    # 2) Group-any mapping
+    if not limit_teachers or len(teacher_opts) < limit_teachers:
+        mapped_any = (
+            db.query(models.GroupTeacherSubject)
+            .filter(models.GroupTeacherSubject.group_id == e.group_id)
+            .all()
+        )
+        for l in mapped_any:
+            if l.teacher_id in seen_teachers:
+                continue
+            t = db.query(models.Teacher).get(l.teacher_id)
+            if not t:
+                continue
+            if _teacher_is_free(db, t.id, ds.date, e.start_time, e.end_time, exclude_entry_id=e.id):
+                teacher_opts.append({"teacher_name": t.name, "source": "group_mapping"})
+                seen_teachers.add(t.id)
+                if limit_teachers and len(teacher_opts) >= limit_teachers:
+                    break
+    # 3) Any free teacher
+    if not limit_teachers or len(teacher_opts) < limit_teachers:
+        all_teachers = db.query(models.Teacher).all()
+        for t in all_teachers:
+            if t.id in seen_teachers:
+                continue
+            if _teacher_is_free(db, t.id, ds.date, e.start_time, e.end_time, exclude_entry_id=e.id):
+                teacher_opts.append({"teacher_name": t.name, "source": "free"})
+                seen_teachers.add(t.id)
+                if limit_teachers and len(teacher_opts) >= limit_teachers:
+                    break
+
+    # Rooms: any room with available capacity
+    room_opts: list[dict] = []
+    all_rooms = db.query(models.Room).all()
+    for r in all_rooms:
+        if _room_has_capacity(db, ds.date, e.start_time, r.id, exclude_entry_id=e.id):
+            cap = 4 if (r and "Спортзал" in r.name) else 1
+            room_opts.append({"room_name": r.name, "capacity": cap})
+            if limit_rooms and len(room_opts) >= limit_rooms:
+                break
+
+    return {
+        "entry_id": e.id,
+        "date": ds.date,
+        "group_name": group.name if group else str(e.group_id),
+        "subject_name": subject.name if subject else str(e.subject_id),
+        "start_time": e.start_time,
+        "end_time": e.end_time,
+        "teachers": teacher_opts,
+        "rooms": room_opts,
+    }
+
+
+def _get_room_by_name(db: Session, room_name: str):
+    return db.query(models.Room).filter(models.Room.name == room_name).first()
+
+
+def _list_conflicts_for_room(db: Session, date_: date, start_time: str, room_id: int, *, exclude_entry_id: int | None = None) -> list[models.DayScheduleEntry]:
+    ds = db.query(models.DaySchedule).filter(models.DaySchedule.date == date_).first()
+    if not ds:
+        return []
+    q = (
+        db.query(models.DayScheduleEntry)
+        .filter(models.DayScheduleEntry.day_schedule_id == ds.id)
+        .filter(models.DayScheduleEntry.room_id == room_id)
+        .filter(models.DayScheduleEntry.start_time == start_time)
+    )
+    if exclude_entry_id:
+        q = q.filter(models.DayScheduleEntry.id != exclude_entry_id)
+    return q.all()
+
+
+def propose_room_swap(
+    db: Session,
+    entry_id: int,
+    desired_room_name: str,
+    *,
+    limit_alternatives: int | None = 5,
+) -> schemas.RoomSwapPlanResponse:
+    e = db.query(models.DayScheduleEntry).filter(models.DayScheduleEntry.id == entry_id).first()
+    if not e:
+        raise ValueError("Entry not found")
+    ds = db.query(models.DaySchedule).get(e.day_schedule_id)
+    room = _get_room_by_name(db, desired_room_name)
+    if not room:
+        raise ValueError("Room not found")
+    # If room has capacity -> no conflicts
+    if _room_has_capacity(db, ds.date, e.start_time, room.id, exclude_entry_id=e.id):
+        return schemas.RoomSwapPlanResponse(
+            entry_id=e.id,
+            date=ds.date,
+            start_time=e.start_time,
+            end_time=e.end_time,
+            desired_room_name=room.name,
+            is_free=True,
+            conflicts=[],
+            can_auto_resolve=True,
+        )
+    # Otherwise find conflicts and alternatives for each
+    conflicts = _list_conflicts_for_room(db, ds.date, e.start_time, room.id, exclude_entry_id=e.id)
+    conflict_items: list[schemas.RoomSwapConflictItem] = []
+    can_auto = True
+    for c in conflicts:
+        g = db.query(models.Group).get(c.group_id)
+        s = db.query(models.Subject).get(c.subject_id)
+        t = db.query(models.Teacher).get(c.teacher_id) if c.teacher_id else None
+        # Alternatives: any room with capacity for c's slot (excluding c itself)
+        alt_rooms: list[str] = []
+        for r in db.query(models.Room).all():
+            if r.id == room.id:
+                continue
+            if _room_has_capacity(db, ds.date, c.start_time, r.id, exclude_entry_id=c.id):
+                alt_rooms.append(r.name)
+                if limit_alternatives and len(alt_rooms) >= limit_alternatives:
+                    break
+        if not alt_rooms:
+            can_auto = False
+        conflict_items.append(
+            schemas.RoomSwapConflictItem(
+                entry_id=c.id,
+                group_name=g.name if g else str(c.group_id),
+                subject_name=s.name if s else str(c.subject_id),
+                teacher_name=(t.name if t else None),
+                room_name=db.query(models.Room).get(c.room_id).name if c.room_id else "",
+                alternatives=alt_rooms,
+            )
+        )
+    return schemas.RoomSwapPlanResponse(
+        entry_id=e.id,
+        date=ds.date,
+        start_time=e.start_time,
+        end_time=e.end_time,
+        desired_room_name=room.name,
+        is_free=False,
+        conflicts=conflict_items,
+        can_auto_resolve=can_auto,
+    )
+
+
+def execute_room_swap(
+    db: Session,
+    entry_id: int,
+    desired_room_name: str,
+    *,
+    choices: list[schemas.RoomSwapChoice] | None = None,
+    dry_run: bool = False,
+) -> Dict:
+    plan = propose_room_swap(db, entry_id, desired_room_name)
+    e = db.query(models.DayScheduleEntry).get(entry_id)
+    ds = db.query(models.DaySchedule).get(e.day_schedule_id)
+    desired_room = _get_room_by_name(db, desired_room_name)
+    if plan.is_free:
+        if dry_run:
+            return {"changed": [{"entry_id": e.id, "old_room": db.query(models.Room).get(e.room_id).name, "new_room": desired_room.name}], "dry_run": True}
+        old_room_name = db.query(models.Room).get(e.room_id).name if e.room_id else None
+        e.room_id = desired_room.id
+        e.status = "replaced_manual"
+        db.add(e)
+        db.commit()
+        report = analyze_day_schedule(db, ds.id, group_name=db.query(models.Group).get(e.group_id).name)
+        return {"changed": [{"entry_id": e.id, "old_room": old_room_name, "new_room": desired_room.name}], "report": report}
+    # Need to reassign conflicts
+    # Build mapping from conflict entry to new room
+    mapping: dict[int, str] = {}
+    if choices:
+        for ch in choices:
+            mapping[ch.entry_id] = ch.room_name
+    changes: list[dict] = []
+    # Resolve each conflict
+    for c in plan.conflicts:
+        new_room_name = mapping.get(c.entry_id)
+        if not new_room_name:
+            if not c.alternatives:
+                raise ValueError(f"No alternative room for entry {c.entry_id}")
+            new_room_name = c.alternatives[0]
+        new_room = _get_room_by_name(db, new_room_name)
+        if not new_room:
+            raise ValueError(f"Room not found: {new_room_name}")
+        # Validate capacity still available
+        if not _room_has_capacity(db, ds.date, e.start_time, new_room.id, exclude_entry_id=c.entry_id):
+            raise ValueError(f"Room not available now: {new_room_name}")
+        if dry_run:
+            changes.append({"entry_id": c.entry_id, "old_room": c.room_name, "new_room": new_room.name})
+        else:
+            ce = db.query(models.DayScheduleEntry).get(c.entry_id)
+            ce.room_id = new_room.id
+            ce.status = "replaced_manual"
+            db.add(ce)
+            changes.append({"entry_id": ce.id, "old_room": c.room_name, "new_room": new_room.name})
+    # After conflicts resolved, assign desired room to main entry
+    if dry_run:
+        changes.append({"entry_id": e.id, "old_room": db.query(models.Room).get(e.room_id).name if e.room_id else None, "new_room": desired_room.name})
+        return {"changed": changes, "dry_run": True}
+    old_room_name = db.query(models.Room).get(e.room_id).name if e.room_id else None
+    e.room_id = desired_room.id
+    e.status = "replaced_manual"
+    db.add(e)
+    changes.append({"entry_id": e.id, "old_room": old_room_name, "new_room": desired_room.name})
+    db.commit()
+    report = analyze_day_schedule(db, ds.id)
+    return {"changed": changes, "report": report}
+
+
 def analyze_day_schedule(db: Session, day_schedule_id: int, group_name: str | None = None) -> Dict:
     ds = db.query(models.DaySchedule).filter(models.DaySchedule.id == day_schedule_id).first()
     if not ds:
@@ -1694,10 +1974,13 @@ def get_day_schedule(db: Session, date_: date, group_name: str | None = None, re
             )
         )
         planned_pairs += 1
-        planned_hours += pair_duration
+        planned_hours += PAIR_SIZE_AH
         if e.status != "pending":
             approved_pairs += 1
-            approved_hours += pair_duration
+            approved_hours += PAIR_SIZE_AH
+    # Compute diffs vs weekly plan
+    plan_entries, diffs, counters = compute_day_plan_diff(db, ds.date, group_name)
+    group_summary, subject_summary = compute_day_summaries(db, ds.date, group_name)
     return schemas.DayPlanResponse(
         id=ds.id,
         date=ds.date,
@@ -1708,6 +1991,11 @@ def get_day_schedule(db: Session, date_: date, group_name: str | None = None, re
         planned_hours=planned_hours,
         approved_hours=approved_hours,
         reasons=(reasons if reasons is not None else None),
+        plan_entries=plan_entries,
+        differences=diffs,
+        diff_counters=counters,
+        group_hours_summary=group_summary,
+        subject_hours_summary=subject_summary,
     )
 
 
@@ -1716,6 +2004,167 @@ def get_last_plan_debug(day_id: int, clear: bool = True) -> list[str]:
     if clear and day_id in _last_plan_debug:
         del _last_plan_debug[day_id]
     return notes
+
+
+def _collect_day_actual_min(db: Session, date_: date, group_id_filter: int | None = None) -> dict[tuple[int, str], dict]:
+    ds = db.query(models.DaySchedule).filter(models.DaySchedule.date == date_).first()
+    res: dict[tuple[int, str], dict] = {}
+    if not ds:
+        return res
+    for e in ds.entries:
+        if group_id_filter and e.group_id != group_id_filter:
+            continue
+        g = db.query(models.Group).get(e.group_id)
+        s = db.query(models.Subject).get(e.subject_id)
+        r = db.query(models.Room).get(e.room_id)
+        t = db.query(models.Teacher).get(e.teacher_id) if e.teacher_id else None
+        res[(e.group_id, e.start_time)] = {
+            "group_name": g.name if g else str(e.group_id),
+            "start_time": e.start_time,
+            "end_time": e.end_time,
+            "subject_name": s.name if s else str(e.subject_id),
+            "teacher_name": t.name if t else None,
+            "room_name": r.name if r else str(e.room_id),
+            "status": e.status,
+        }
+    return res
+
+
+def _collect_day_weekly_plan_min(db: Session, date_: date, group_id_filter: int | None = None) -> dict[tuple[int, str], dict]:
+    week_start = _get_week_start(date_)
+    dow = days[date_.weekday()]
+    res: dict[tuple[int, str], dict] = {}
+    dists = db.query(models.WeeklyDistribution).filter(models.WeeklyDistribution.week_start == week_start).all()
+    for d in dists:
+        it = d.schedule_item
+        if group_id_filter and it.group_id != group_id_filter:
+            continue
+        for slot in d.daily_schedule or []:
+            if slot.get("day") != dow:
+                continue
+            res[(it.group_id, slot["start_time"])] = {
+                "group_name": it.group.name,
+                "start_time": slot["start_time"],
+                "end_time": slot["end_time"],
+                "subject_name": it.subject.name,
+                "teacher_name": it.teacher.name,
+                "room_name": it.room.name,
+            }
+    return res
+
+
+def compute_day_plan_diff(db: Session, date_: date, group_name: str | None = None) -> tuple[list[schemas.DayPlanEntry], list[dict], dict]:
+    group_id: int | None = None
+    if group_name:
+        g = db.query(models.Group).filter(models.Group.name == group_name).first()
+        if g:
+            group_id = g.id
+    actual = _collect_day_actual_min(db, date_, group_id)
+    plan = _collect_day_weekly_plan_min(db, date_, group_id)
+    # Build plan entries for response
+    plan_entries: list[schemas.DayPlanEntry] = []
+    for v in sorted(plan.values(), key=lambda x: (x["group_name"], x["start_time"])):
+        plan_entries.append(
+            schemas.DayPlanEntry(
+                id=0,
+                group_name=v["group_name"],
+                subject_name=v["subject_name"],
+                teacher_name=v["teacher_name"],
+                room_name=v["room_name"],
+                start_time=v["start_time"],
+                end_time=v["end_time"],
+                status="planned",
+            )
+        )
+    # Differences
+    keys = set(actual.keys()) | set(plan.keys())
+    diff_rows: list[dict] = []
+    counters: dict[str, int] = {"added": 0, "removed": 0, "changed": 0, "same": 0}
+    for k in sorted(keys, key=lambda x: (x[0], x[1])):
+        a = actual.get(k)
+        p = plan.get(k)
+        group_name_v = a["group_name"] if a else (p["group_name"] if p else "")
+        start_time = a["start_time"] if a else (p["start_time"] if p else "")
+        if a and not p:
+            dtype = "added"
+        elif p and not a:
+            dtype = "removed"
+        else:
+            changed = any([
+                a.get("subject_name") != p.get("subject_name"),
+                a.get("teacher_name") != p.get("teacher_name"),
+                a.get("room_name") != p.get("room_name"),
+            ])
+            dtype = "changed" if changed else "same"
+        counters[dtype] = counters.get(dtype, 0) + 1
+        diff_rows.append(
+            {
+                "group_name": group_name_v,
+                "start_time": start_time,
+                "type": dtype,
+                "plan_subject": (p.get("subject_name") if p else None),
+                "plan_teacher": (p.get("teacher_name") if p else None),
+                "plan_room": (p.get("room_name") if p else None),
+                "actual_subject": (a.get("subject_name") if a else None),
+                "actual_teacher": (a.get("teacher_name") if a else None),
+                "actual_room": (a.get("room_name") if a else None),
+            }
+        )
+    return plan_entries, diff_rows, counters
+
+
+def compute_day_summaries(db: Session, date_: date, group_name: str | None = None) -> tuple[list[dict], list[dict]]:
+    """Compute per-group and per-subject plan vs actual summaries for the date.
+    Returns (group_summary, subject_summary).
+    """
+    # Build minimal maps
+    group_id: int | None = None
+    if group_name:
+        g = db.query(models.Group).filter(models.Group.name == group_name).first()
+        if g:
+            group_id = g.id
+    actual = _collect_day_actual_min(db, date_, group_id)
+    plan = _collect_day_weekly_plan_min(db, date_, group_id)
+    # Per-group aggregation
+    groups = sorted({v["group_name"] for v in (list(actual.values()) + list(plan.values()))})
+    group_rows: list[dict] = []
+    for gname in groups:
+        ap = sum(1 for (_gid, st), v in actual.items() if v["group_name"] == gname)
+        pp = sum(1 for (_gid, st), v in plan.items() if v["group_name"] == gname)
+        group_rows.append({
+            "group_name": gname,
+            "actual_pairs": ap,
+            "plan_pairs": pp,
+            "delta_pairs": ap - pp,
+            "actual_hours_AH": ap * PAIR_SIZE_AH,
+            "plan_hours_AH": pp * PAIR_SIZE_AH,
+            "delta_hours_AH": (ap - pp) * PAIR_SIZE_AH,
+        })
+    # Per-subject aggregation per group
+    subject_key = []
+    for v in actual.values():
+        subject_key.append((v["group_name"], v["subject_name"]))
+    for v in plan.values():
+        subject_key.append((v["group_name"], v["subject_name"]))
+    subject_pairs = sorted(set(subject_key))
+    subject_rows: list[dict] = []
+    for gname, sname in subject_pairs:
+        ap = sum(1 for (_gid, st), v in actual.items() if v["group_name"] == gname and v["subject_name"] == sname)
+        pp = sum(1 for (_gid, st), v in plan.items() if v["group_name"] == gname and v["subject_name"] == sname)
+        subject_rows.append({
+            "group_name": gname,
+            "subject_name": sname,
+            "actual_pairs": ap,
+            "plan_pairs": pp,
+            "delta_pairs": ap - pp,
+            "actual_hours_AH": ap * PAIR_SIZE_AH,
+            "plan_hours_AH": pp * PAIR_SIZE_AH,
+            "delta_hours_AH": (ap - pp) * PAIR_SIZE_AH,
+        })
+    # Sort for stable output
+    group_rows.sort(key=lambda r: r["group_name"])
+    subject_rows.sort(key=lambda r: (r["group_name"], r["subject_name"]))
+    return group_rows, subject_rows
 
 
 def approve_day_schedule(db: Session, day_schedule_id: int, group_name: str | None = None, record_progress: bool = True) -> Dict:
@@ -1751,7 +2200,7 @@ def approve_day_schedule(db: Session, day_schedule_id: int, group_name: str | No
                 p = models.SubjectProgress(
                     schedule_item_id=e.schedule_item_id,
                     date=ds.date,
-                    hours=pair_duration,
+                    hours=PAIR_SIZE_AH,
                     note=note,
                 )
                 db.add(p)
@@ -1762,7 +2211,17 @@ def approve_day_schedule(db: Session, day_schedule_id: int, group_name: str | No
     db.add(ds)
     db.commit()
     remaining_pending = sum(1 for e in ds.entries if e.status == "pending")
-    return {"status": ds.status, "approved_entries": approved, "created_progress_entries": created_progress, "remaining_pending": remaining_pending}
+    # Attach fresh diff after approval
+    plan_entries, diffs, counters = compute_day_plan_diff(db, ds.date, group_name)
+    return {
+        "status": ds.status,
+        "approved_entries": approved,
+        "created_progress_entries": created_progress,
+        "remaining_pending": remaining_pending,
+        "plan_entries": [pe.model_dump() for pe in plan_entries],
+        "differences": diffs,
+        "diff_counters": counters,
+    }
 
 
 # ---- Progress entries ----
@@ -1952,6 +2411,7 @@ def query_schedule(
                 set(),
                 set(),
                 defaultdict(set),
+                pair_size_ah=PAIR_SIZE_AH,
             )
         if not daily:
             continue
@@ -2276,4 +2736,362 @@ def progress_timeseries(
         daily = by_date[d]
         total += daily
         points.append(schemas.ProgressTimeseriesPoint(date=d, hours=daily, cumulative_hours=total))
+    return points
+
+# ---- Day planning: delegate to service layer (override legacy defs) ----
+from app.services import day_planning_service as _day
+
+
+def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> models.DaySchedule:  # type: ignore[override]
+    return _day.plan_day_schedule(db, request)
+
+
+def analyze_day_schedule(db: Session, day_schedule_id: int, group_name: str | None = None) -> Dict:  # type: ignore[override]
+    return _day.analyze_day_schedule(db, day_schedule_id, group_name)
+
+
+def get_day_schedule(db: Session, date_: date, group_name: str | None = None, reasons: list[str] | None = None) -> schemas.DayPlanResponse:  # type: ignore[override]
+    return _day.get_day_schedule(db, date_, group_name, reasons)
+
+
+def get_entry_replacement_options(
+    db: Session,
+    entry_id: int,
+    *,
+    limit_teachers: int | None = 20,
+    limit_rooms: int | None = 20,
+) -> Dict:  # type: ignore[override]
+    return _day.get_entry_replacement_options(db, entry_id, limit_teachers=limit_teachers or 20, limit_rooms=limit_rooms or 20)
+
+
+def propose_room_swap(
+    db: Session,
+    entry_id: int,
+    desired_room_name: str,
+    *,
+    limit_alternatives: int | None = 5,
+):  # type: ignore[override]
+    return _day.propose_room_swap(db, entry_id, desired_room_name, limit_alternatives=limit_alternatives or 5)
+
+
+def execute_room_swap(
+    db: Session,
+    entry_id: int,
+    desired_room_name: str,
+    *,
+    choices: list[schemas.RoomSwapChoice] | None = None,
+    dry_run: bool = False,
+) -> Dict:  # type: ignore[override]
+    return _day.execute_room_swap(db, entry_id, desired_room_name, choices=choices or [], dry_run=dry_run)
+
+
+def replace_vacant_auto(db: Session, day_schedule_id: int) -> Dict:  # type: ignore[override]
+    return _day.replace_vacant_auto(db, day_schedule_id)
+
+
+def replace_entry_manual(db: Session, entry_id: int, teacher_name: str) -> Dict:  # type: ignore[override]
+    return _day.replace_entry_manual(db, entry_id, teacher_name)
+
+
+def update_entry_manual(
+    db: Session,
+    entry_id: int,
+    *,
+    teacher_name: str | None = None,
+    subject_name: str | None = None,
+    room_name: str | None = None,
+) -> Dict:  # type: ignore[override]
+    return _day.update_entry_manual(db, entry_id, teacher_name=teacher_name, subject_name=subject_name, room_name=room_name)
+
+
+def lookup_day_entries(
+    db: Session,
+    *,
+    date_: date | None = None,
+    day_id: int | None = None,
+    group_name: str | None = None,
+    start_time: str | None = None,
+    subject_name: str | None = None,
+    room_name: str | None = None,
+    teacher_name: str | None = None,
+) -> list[schemas.EntryLookupItem]:  # type: ignore[override]
+    return _day.lookup_day_entries(
+        db,
+        date_=date_,
+        day_id=day_id,
+        group_name=group_name,
+        start_time=start_time,
+        subject_name=subject_name,
+        room_name=room_name,
+        teacher_name=teacher_name,
+    )
+
+
+def bulk_update_day_entries_strict(
+    db: Session,
+    day_id: int,
+    items: list[schemas.BulkUpdateEntryStrict],
+    *,
+    dry_run: bool = False,
+) -> dict:  # type: ignore[override]
+    return _day.bulk_update_day_entries_strict(db, day_id, items, dry_run=dry_run)
+
+
+# ---- Analytics helpers ----
+def _analytics_collect_entries(
+    db: Session,
+    start_date: date,
+    end_date: date,
+    filters: schemas.AnalyticsFilter,
+) -> list[schemas.ScheduleQueryEntry]:
+    items = query_schedule(db, start_date=start_date, end_date=end_date)
+    # Apply name-based filters
+    def _in_or_all(val: str, allowed: list[str] | None):
+        return True if not allowed else (val in allowed)
+    result = [
+        it for it in items
+        if _in_or_all(it.group_name, filters.groups)
+        and _in_or_all(it.teacher_name, filters.teachers)
+        and _in_or_all(it.subject_name, filters.subjects)
+        and _in_or_all(it.room_name, filters.rooms)
+    ]
+    if bool(filters.only_approved):
+        result = [it for it in result if it.origin == "day_plan" and (it.approval_status == "approved")]
+    return result
+
+
+def analytics_teacher_summary(db: Session, req: schemas.AnalyticsFilter) -> list[schemas.TeacherSummaryItem]:
+    items = _analytics_collect_entries(db, req.start_date, req.end_date, req)
+    bucket: dict[tuple[str, str, str], dict] = defaultdict(lambda: {"planned": 0, "actual": 0})
+    for it in items:
+        key = (it.teacher_name, it.group_name, it.subject_name)
+        bucket[key]["planned"] += 1
+        if it.origin == "day_plan":
+            bucket[key]["actual"] += 1
+    total_map: dict[tuple[str, str, str], float] = defaultdict(float)
+    q = db.query(models.ScheduleItem).join(models.Group).join(models.Subject).join(models.Teacher)
+    if req.groups:
+        q = q.filter(models.Group.name.in_(req.groups))
+    if req.teachers:
+        q = q.filter(models.Teacher.name.in_(req.teachers))
+    if req.subjects:
+        q = q.filter(models.Subject.name.in_(req.subjects))
+    for si in q.all():
+        key = (si.teacher.name, si.group.name, si.subject.name)
+        total_map[key] += float(si.total_hours)
+    # Manual progress (SubjectProgress) aggregated per (teacher, group, subject)
+    manual_map: dict[tuple[str, str, str], float] = defaultdict(float)
+    q_prog = db.query(models.SubjectProgress).join(models.ScheduleItem).join(models.Group).join(models.Subject).join(models.Teacher)
+    q_prog = q_prog.filter(models.SubjectProgress.date >= req.start_date, models.SubjectProgress.date <= req.end_date)
+    if req.groups:
+        q_prog = q_prog.filter(models.Group.name.in_(req.groups))
+    if req.teachers:
+        q_prog = q_prog.filter(models.Teacher.name.in_(req.teachers))
+    if req.subjects:
+        q_prog = q_prog.filter(models.Subject.name.in_(req.subjects))
+    for p, si, g, s, t in q_prog.with_entities(models.SubjectProgress, models.ScheduleItem, models.Group, models.Subject, models.Teacher).all():
+        key = (t.name, g.name, s.name)
+        manual_map[key] += float(p.hours or 0.0)
+
+    result: list[schemas.TeacherSummaryItem] = []
+    for (tname, gname, sname), vals in bucket.items():
+        planned_pairs = vals["planned"]
+        actual_pairs = vals["actual"]
+        planned_h = planned_pairs * PAIR_SIZE_AH
+        actual_h = actual_pairs * PAIR_SIZE_AH
+        total_h = total_map.get((tname, gname, sname), 0.0)
+        percent_assigned = (planned_h / total_h * 100.0) if total_h > 0 else 0.0
+        percent_actual = (actual_h / total_h * 100.0) if total_h > 0 else 0.0
+        manual_h = manual_map.get((tname, gname, sname), 0.0)
+        effective_h = min(total_h, actual_h + manual_h)
+        percent_effective = (effective_h / total_h * 100.0) if total_h > 0 else 0.0
+        result.append(
+            schemas.TeacherSummaryItem(
+                teacher_name=tname,
+                group_name=gname,
+                subject_name=sname,
+                planned_pairs=planned_pairs,
+                planned_hours_AH=planned_h,
+                actual_pairs=actual_pairs,
+                actual_hours_AH=actual_h,
+                total_plan_hours_AH=total_h,
+                percent_assigned=percent_assigned,
+                percent_actual=percent_actual,
+                manual_completed_hours_AH=manual_h,
+                effective_hours_AH=effective_h,
+                percent_effective=percent_effective,
+            )
+        )
+    result.sort(key=lambda r: (r.teacher_name, r.group_name, r.subject_name))
+    return result
+
+
+def analytics_group_summary(db: Session, req: schemas.AnalyticsFilter) -> list[schemas.GroupSubjectSummaryItem]:
+    items = _analytics_collect_entries(db, req.start_date, req.end_date, req)
+    bucket: dict[tuple[str, str], dict] = defaultdict(lambda: {"planned": 0, "actual": 0})
+    for it in items:
+        key = (it.group_name, it.subject_name)
+        bucket[key]["planned"] += 1
+        if it.origin == "day_plan":
+            bucket[key]["actual"] += 1
+    total_map: dict[tuple[str, str], float] = defaultdict(float)
+    q = db.query(models.ScheduleItem).join(models.Group).join(models.Subject)
+    if req.groups:
+        q = q.filter(models.Group.name.in_(req.groups))
+    if req.subjects:
+        q = q.filter(models.Subject.name.in_(req.subjects))
+    for si in q.all():
+        key = (si.group.name, si.subject.name)
+        total_map[key] += float(si.total_hours)
+    # Manual progress aggregated per (group, subject)
+    manual_map: dict[tuple[str, str], float] = defaultdict(float)
+    q_prog = db.query(models.SubjectProgress).join(models.ScheduleItem).join(models.Group).join(models.Subject)
+    q_prog = q_prog.filter(models.SubjectProgress.date >= req.start_date, models.SubjectProgress.date <= req.end_date)
+    if req.groups:
+        q_prog = q_prog.filter(models.Group.name.in_(req.groups))
+    if req.subjects:
+        q_prog = q_prog.filter(models.Subject.name.in_(req.subjects))
+    for p, si, g, s in q_prog.with_entities(models.SubjectProgress, models.ScheduleItem, models.Group, models.Subject).all():
+        key = (g.name, s.name)
+        manual_map[key] += float(p.hours or 0.0)
+
+    result: list[schemas.GroupSubjectSummaryItem] = []
+    for (gname, sname), vals in bucket.items():
+        planned_pairs = vals["planned"]
+        actual_pairs = vals["actual"]
+        planned_h = planned_pairs * PAIR_SIZE_AH
+        actual_h = actual_pairs * PAIR_SIZE_AH
+        total_h = total_map.get((gname, sname), 0.0)
+        manual_h = manual_map.get((gname, sname), 0.0)
+        effective_h = min(total_h, actual_h + manual_h)
+        result.append(
+            schemas.GroupSubjectSummaryItem(
+                group_name=gname,
+                subject_name=sname,
+                planned_pairs=planned_pairs,
+                planned_hours_AH=planned_h,
+                actual_pairs=actual_pairs,
+                actual_hours_AH=actual_h,
+                total_plan_hours_AH=total_h,
+                percent_assigned=(planned_h / total_h * 100.0) if total_h > 0 else 0.0,
+                percent_actual=(actual_h / total_h * 100.0) if total_h > 0 else 0.0,
+                manual_completed_hours_AH=manual_h,
+                effective_hours_AH=effective_h,
+                percent_effective=(effective_h / total_h * 100.0) if total_h > 0 else 0.0,
+            )
+        )
+    result.sort(key=lambda r: (r.group_name, r.subject_name))
+    return result
+
+
+def analytics_room_summary(db: Session, req: schemas.AnalyticsFilter) -> list[schemas.RoomSummaryItem]:
+    items = _analytics_collect_entries(db, req.start_date, req.end_date, req)
+    bucket: dict[str, dict] = defaultdict(lambda: {"planned": 0, "actual": 0})
+    for it in items:
+        bucket[it.room_name]["planned"] += 1
+        if it.origin == "day_plan":
+            bucket[it.room_name]["actual"] += 1
+    result: list[schemas.RoomSummaryItem] = []
+    for rname, vals in bucket.items():
+        planned_pairs = vals["planned"]
+        actual_pairs = vals["actual"]
+        result.append(
+            schemas.RoomSummaryItem(
+                room_name=rname,
+                planned_pairs=planned_pairs,
+                actual_pairs=actual_pairs,
+                planned_hours_AH=planned_pairs * PAIR_SIZE_AH,
+                actual_hours_AH=actual_pairs * PAIR_SIZE_AH,
+            )
+        )
+    result.sort(key=lambda r: (r.actual_pairs, r.planned_pairs), reverse=True)
+    return result
+
+
+def analytics_heatmap(db: Session, dimension: str, name: str, req: schemas.AnalyticsFilter) -> schemas.HeatmapResponse:
+    dim = dimension.lower()
+    filters = schemas.AnalyticsFilter(**req.model_dump())
+    if dim == "teacher":
+        filters.teachers = [name]
+    elif dim == "group":
+        filters.groups = [name]
+    elif dim == "room":
+        filters.rooms = [name]
+    else:
+        raise ValueError("dimension must be teacher|group|room")
+    items = _analytics_collect_entries(db, req.start_date, req.end_date, filters)
+    dnames = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    slots = [s["start"] for s in (SHIFT1_SLOTS + SHIFT2_SLOTS)]
+    idx_d = {d: i for i, d in enumerate(dnames)}
+    idx_s = {s: i for i, s in enumerate(slots)}
+    matrix = [[0 for _ in slots] for __ in dnames]
+    for it in items:
+        di = idx_d.get(it.day)
+        si = idx_s.get(it.start_time)
+        if di is not None and si is not None:
+            matrix[di][si] += 1
+    totals_by_day = [sum(row) for row in matrix]
+    totals_by_slot = [sum(matrix[r][c] for r in range(len(dnames))) for c in range(len(slots))]
+    return schemas.HeatmapResponse(days=dnames, slots=slots, matrix=matrix, totals_by_day=totals_by_day, totals_by_slot=totals_by_slot)
+
+
+def analytics_distribution(db: Session, dimension: str, req: schemas.AnalyticsFilter) -> list[schemas.DistributionItem]:
+    items = _analytics_collect_entries(db, req.start_date, req.end_date, req)
+    key_fn = {
+        "teacher": lambda it: it.teacher_name,
+        "group": lambda it: it.group_name,
+        "subject": lambda it: it.subject_name,
+        "room": lambda it: it.room_name,
+    }.get(dimension.lower())
+    if not key_fn:
+        raise ValueError("dimension must be teacher|group|subject|room")
+    bucket: dict[str, dict] = defaultdict(lambda: {"planned": 0, "actual": 0})
+    for it in items:
+        k = key_fn(it)
+        bucket[k]["planned"] += 1
+        if it.origin == "day_plan":
+            bucket[k]["actual"] += 1
+    result: list[schemas.DistributionItem] = []
+    for name, vals in bucket.items():
+        pp = vals["planned"]
+        ap = vals["actual"]
+        result.append(
+            schemas.DistributionItem(
+                name=name,
+                planned_pairs=pp,
+                actual_pairs=ap,
+                planned_hours_AH=pp * PAIR_SIZE_AH,
+                actual_hours_AH=ap * PAIR_SIZE_AH,
+            )
+        )
+    result.sort(key=lambda r: (r.actual_pairs, r.planned_pairs), reverse=True)
+    return result
+
+
+def analytics_schedule_timeseries(db: Session, req: schemas.AnalyticsFilter) -> list[schemas.ScheduleTimeseriesPoint]:
+    items = _analytics_collect_entries(db, req.start_date, req.end_date, req)
+    cur = req.start_date
+    buckets: dict[date, dict] = {}
+    while cur <= req.end_date:
+        buckets[cur] = {"planned": 0, "actual": 0}
+        cur += timedelta(days=1)
+    for it in items:
+        d = it.date
+        if d in buckets:
+            buckets[d]["planned"] += 1
+            if it.origin == "day_plan":
+                buckets[d]["actual"] += 1
+    points: list[schemas.ScheduleTimeseriesPoint] = []
+    for d in sorted(buckets.keys()):
+        pp = buckets[d]["planned"]
+        ap = buckets[d]["actual"]
+        points.append(
+            schemas.ScheduleTimeseriesPoint(
+                date=d,
+                planned_pairs=pp,
+                actual_pairs=ap,
+                planned_hours_AH=pp * PAIR_SIZE_AH,
+                actual_hours_AH=ap * PAIR_SIZE_AH,
+            )
+        )
     return points

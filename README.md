@@ -44,6 +44,10 @@ Core endpoints
     - `record_progress` — create SubjectProgress entries (default: true)
     - `enforce_no_blockers` — abort approval if blockers detected (default: false)
     - Returns a detailed `report` with stats, warnings, and blockers.
+  - Responses for day planning/approval include reference weekly plan and differences:
+    - `plan_entries`: ожидаемые пары по недельному плану на эту дату
+    - `differences`: список отличий по каждой группе/времени (`added|removed|changed|same` с деталями по предмету/преподавателю/аудитории)
+    - `diff_counters`: агрегированные счётчики отличий
   - `POST /schedule/day/{day_id}/replace_vacant_auto` — (protected) run auto-replacement manually.
   - `POST /schedule/day/replace_entry_manual` — (protected) manually set a teacher for an entry. Response includes a per-group validation `report`.
   - `POST /schedule/day/update_entry_manual` — (protected) advanced manual update of an entry (teacher/subject/room) with validation report.
@@ -71,6 +75,20 @@ Notes
 - Remaining hours consider manual progress if provided; otherwise they reflect assigned slots.
 - Структура проекта: код в пакете `app/` (main, core, models, schemas, services, api/routers).
 
+Hours and parity
+
+- Excel fields `часы` and `количество часов в неделю` are treated as academic hours (45‑minute units).
+- One scheduled lesson slot (pair) equals 2 academic hours (2×45=90 minutes) by default.
+- Weekly distribution for odd cases follows parity priority:
+  - 5 weekly hours with `правая` (even_priority) → 3 pairs on even weeks, 2 pairs on odd weeks.
+  - 1 weekly hour with `левая` (odd_priority) → 1 pair on odd weeks, 0 on even weeks.
+- New config knobs:
+  - `.env`: `PAIR_SIZE_ACADEMIC_HOURS` (default 2), `PARITY_BASE_DATE` (default 2025‑09‑01), `TOTAL_HOURS_IS_ANNUAL` (default false).
+  - Request overrides in `POST /schedule/generate_semester` body:
+    - `total_hours_is_annual?: bool` — if true, Excel totals are annual, halve for semester.
+    - `parity_base_date?: YYYY-MM-DD` — base date to compute even/odd weeks.
+    - `pair_size_academic_hours?: int` — size of one pair in academic hours.
+
 Logging
 
 - Logs include request IDs and are written to console and `logs/app.log` (rotating).
@@ -90,3 +108,38 @@ Security
   - Restrict `/admin/*` by IP (reverse proxy) and TLS only.
   - Rotate `ADMIN_API_KEY` periodically and store in a secrets manager.
   - Consider OAuth2 if you need multi-user roles.
+Export
+
+- POST /export/day — Excel за один день с диффом план↔факт
+  - Тело: `{ "date": "YYYY-MM-DD", "groups": ["Т25-1", "П25-1А"] }` (если `groups` не задан — все группы)
+  - Листы: Day Actual, Day Plan, Diff (с подсветкой), Hours Summary
+
+- POST /export/schedule — универсальная выгрузка за период (план/факт/дифф)
+  - Диапазон:
+    - `start_date` + `end_date`, либо
+    - `period=week|month|semester` с:
+      - `anchor_date=YYYY-MM-DD` для week/month
+      - `semester_name=...` для semester (по GeneratedSchedule)
+  - Фильтры: `groups: [..]` — список групп (без параметра — все группы)
+  - Вид: `view=plan|actual|diff|all` (по умолчанию all)
+  - Разнести по листам: `split_by_group=true` — отдельные листы Plan/Actual/Diff для каждой группы
+  - Подсветка отличий в листах Diff (added — зелёным, removed — красным, changed — жёлтым)
+  - Быстрая ручная правка и замены:
+    - `GET /schedule/day/entry/{entry_id}/options` — подсказки для замены: свободные преподаватели (приоритезированы по маппингу группы/предмета) и свободные аудитории на этот слот.
+    - `GET /schedule/day/entry/{entry_id}/room_swap_plan?desired_room_name=...` — план “освобождения” занятой аудитории: кто сейчас сидит и куда их можно переставить; флаг `can_auto_resolve` если у всех есть альтернатива.
+    - `POST /schedule/day/entry/{entry_id}/swap_room` — выполнить перестановку аудиторий (каскадно):
+      - Тело: `{ "desired_room_name": "ГК205", "choices": [{ "entry_id": 123, "room_name": "ГК206" }], "dry_run": false }`
+      - Если `choices` не задан — система возьмёт первую подходящую альтернативу для каждого конфликта; `dry_run: true` — только показать, что изменится.
+- Analytics
+  - `POST /analytics/teacher/summary` — сводка по преподавателям (нагрузка и прогресс):
+    - Тело: `{ start_date, end_date, teachers?: [..], groups?: [..], subjects?: [..] }`
+    - Для каждого (преподаватель, группа, предмет): planned/actual пары и часы (AH), total_plan_hours_AH (из плана), проценты `percent_assigned` и `percent_actual`.
+  - `POST /analytics/group/summary` — сводка по группам (по предметам):
+    - Тело: `{ start_date, end_date, groups?: [..], subjects?: [..] }`
+    - Для каждого (группа, предмет): planned/actual пары/часы, общий план, проценты выполнения.
+  - `POST /analytics/room/summary` — сводка по занятости аудиторий (больше всего занята):
+    - Тело: `{ start_date, end_date, rooms?: [..], groups?: [..], teachers?: [..] }`
+    - Для каждой аудитории: planned/actual пары/часы, отсортировано по занятости.
+  - `POST /analytics/heatmap?dimension=teacher|group|room&name=...` — тепловая карта по дням/слотам.
+  - `POST /analytics/distribution?dimension=teacher|group|subject|room` — распределения для bar‑чартов.
+  - `POST /analytics/timeseries` — дневной ряд planned vs actual (для линий/столбцов): `{ start_date, end_date, groups?, teachers?, subjects?, rooms? }`.

@@ -2,7 +2,8 @@ import logging
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from sqlalchemy.orm import Session
-from app.services import crud
+from app.services import schedule_service as sched_svc
+from app.services import day_planning_service as day_svc
 from app import schemas
 from app.core.database import get_db, SessionLocal
 from datetime import datetime, date
@@ -56,7 +57,7 @@ def query_schedule(
             group_name,
             teacher_name,
         )
-        items = crud.query_schedule(
+        items = sched_svc.query_schedule(
             db,
             date_=d,
             start_date=sd,
@@ -70,11 +71,6 @@ def query_schedule(
         raise HTTPException(status_code=400, detail=str(e))
 
 
- 
-
- 
-
-
 _generation_jobs: dict[str, dict] = {}
 
 
@@ -82,8 +78,8 @@ def _background_generate_semester(job_id: str, request: schemas.GenerateSchedule
     logger.info("[GEN %s] Background semester generation started: %s -> %s, semester=%s, group=%s", job_id, request.start_date, request.end_date, request.semester, request.group_name or "ALL")
     db = SessionLocal()
     try:
-        gens = crud.generate_schedule(db, request)
-        resp = [crud.get_generated_schedule(db, g.id) for g in gens]
+        gens = sched_svc.generate_schedule(db, request)
+        resp = [sched_svc.get_generated_schedule(db, g.id) for g in gens]
         _generation_jobs[job_id] = {"status": "done", "result": resp}
         logger.info("[GEN %s] Done. Generated %d schedules", job_id, len(resp))
     except Exception as e:
@@ -110,8 +106,8 @@ def generate_semester_endpoint(request: schemas.GenerateScheduleRequest, backgro
         # sync mode
         logger.info("Generate semester (sync): %s -> %s, semester=%s, group=%s", request.start_date, request.end_date, request.semester, request.group_name or "ALL")
         db = SessionLocal()
-        gens = crud.generate_schedule(db, request)
-        resp = [crud.get_generated_schedule(db, g.id) for g in gens]
+        gens = sched_svc.generate_schedule(db, request)
+        resp = [sched_svc.get_generated_schedule(db, g.id) for g in gens]
         db.close()
         logger.info("Generated %d schedules", len(resp))
         return resp
@@ -160,17 +156,64 @@ def plan_day(request: schemas.DayPlanCreateRequest, db: Session = Depends(get_db
             request.from_plan,
             request.auto_vacant_remove,
         )
-        ds = crud.plan_day_schedule(db, request)
+        ds = day_svc.plan_day_schedule(db, request)
         if request.auto_vacant_remove:
-            crud.replace_vacant_auto(db, ds.id)
+            day_svc.replace_vacant_auto(db, ds.id)
         # Prepare debug reasons if requested
         reasons = None
         if request.debug:
-            reasons = crud.get_last_plan_debug(ds.id, clear=True)
+            try:
+                # Reuse debug notes from legacy storage if available
+                from app.services import crud as _legacy_crud
+                reasons = _legacy_crud.get_last_plan_debug(ds.id, clear=True)
+            except Exception:
+                reasons = None
         # Return only the requested group if provided; otherwise full day
-        return crud.get_day_schedule(db, request.date, request.group_name, reasons)
+        return day_svc.get_day_schedule(db, request.date, request.group_name, reasons)
     except ValueError as e:
         logger.warning("Plan day failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get(
+    "/day/entry/{entry_id}/options",
+    summary="Get replacement options (teachers/rooms) for a day entry",
+    tags=["day_plan"],
+)
+def get_entry_options(entry_id: int, limit_teachers: int = 20, limit_rooms: int = 20, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    try:
+        opts = day_svc.get_entry_replacement_options(db, entry_id, limit_teachers=limit_teachers, limit_rooms=limit_rooms)
+        return opts
+    except ValueError as e:
+        logger.warning("Get entry options failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get(
+    "/day/entry/{entry_id}/room_swap_plan",
+    summary="Propose a room swap plan to free a busy room for entry",
+    tags=["day_plan"],
+)
+def room_swap_plan(entry_id: int, desired_room_name: str, limit_alternatives: int = 5, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    try:
+        plan = day_svc.propose_room_swap(db, entry_id, desired_room_name, limit_alternatives=limit_alternatives)
+        return plan
+    except ValueError as e:
+        logger.warning("Room swap plan failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post(
+    "/day/entry/{entry_id}/swap_room",
+    summary="Execute room swap (reassign conflicting entries then set desired room)",
+    tags=["day_plan"],
+)
+def swap_room(entry_id: int, req: schemas.SwapRoomRequest, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    try:
+        result = day_svc.execute_room_swap(db, entry_id, req.desired_room_name, choices=req.choices or [], dry_run=bool(req.dry_run))
+        return result
+    except ValueError as e:
+        logger.warning("Swap room failed: %s", e)
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -188,7 +231,7 @@ def get_day(
     try:
         d = datetime.strptime(date, "%Y-%m-%d").date()
         logger.info("Get day: %s", d)
-        return crud.get_day_schedule(db, d, group_name)
+        return day_svc.get_day_schedule(db, d, group_name)
     except ValueError as e:
         logger.warning("Get day failed: %s", e)
         raise HTTPException(status_code=400, detail=str(e))
@@ -211,12 +254,12 @@ def approve_day(
     try:
         logger.info("Approve day id=%s group=%s record_progress=%s", day_id, group_name, record_progress)
         if enforce_no_blockers:
-            pre = crud.analyze_day_schedule(db, day_id, group_name=group_name)
+            pre = day_svc.analyze_day_schedule(db, day_id, group_name=group_name)
             if pre.get("blockers_count", 0) > 0:
                 raise ValueError("Approval blocked: blockers present. Request report via /schedule/day/{day_id}/report")
-        result = crud.approve_day_schedule(db, day_id, group_name=group_name, record_progress=record_progress)
+        result = day_svc.approve_day_schedule(db, day_id, group_name=group_name, record_progress=record_progress)
         # Attach validation report after approval for visibility
-        report = crud.analyze_day_schedule(db, day_id, group_name=group_name)
+        report = day_svc.analyze_day_schedule(db, day_id, group_name=group_name)
         result["report"] = report
         return result
     except ValueError as e:
@@ -233,7 +276,7 @@ def approve_day(
 def replace_vacant_auto(day_id: int, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
     try:
         logger.info("Replace vacant auto day_id=%s", day_id)
-        return crud.replace_vacant_auto(db, day_id)
+        return day_svc.replace_vacant_auto(db, day_id)
     except ValueError as e:
         logger.warning("Replace vacant auto failed: %s", e)
         raise HTTPException(status_code=400, detail=str(e))
@@ -248,7 +291,7 @@ def replace_vacant_auto(day_id: int, db: Session = Depends(get_db), _: bool = De
 def replace_entry_manual(req: schemas.ReplaceEntryManualRequest, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
     try:
         logger.info("Replace entry manual id=%s -> teacher=%s", req.entry_id, req.teacher_name)
-        return crud.replace_entry_manual(db, req.entry_id, req.teacher_name)
+        return day_svc.replace_entry_manual(db, req.entry_id, req.teacher_name)
     except ValueError as e:
         logger.warning("Replace entry manual failed: %s", e)
         raise HTTPException(status_code=400, detail=str(e))
@@ -267,7 +310,7 @@ def get_day_report(
 ):
     try:
         logger.info("Day report id=%s group=%s", day_id, group_name)
-        report = crud.analyze_day_schedule(db, day_id, group_name=group_name)
+        report = day_svc.analyze_day_schedule(db, day_id, group_name=group_name)
         return schemas.DayReport.model_validate(report)
     except ValueError as e:
         logger.warning("Day report failed: %s", e)
@@ -289,7 +332,7 @@ def update_entry_manual(req: schemas.UpdateEntryManualRequest, db: Session = Dep
             req.subject_name,
             req.room_name,
         )
-        return crud.update_entry_manual(
+        return day_svc.update_entry_manual(
             db,
             req.entry_id,
             teacher_name=req.teacher_name,
@@ -321,7 +364,7 @@ def entry_lookup(
         d: Optional[date] = None
         if date:
             d = datetime.strptime(date, "%Y-%m-%d").date()
-        items = crud.lookup_day_entries(
+        items = day_svc.lookup_day_entries(
             db,
             date_=d,
             day_id=day_id,

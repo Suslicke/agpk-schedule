@@ -7,6 +7,8 @@ from app.core.database import get_db, SessionLocal
 from app.core.security import require_admin
 from app import schemas
 from app.services import crud
+from app.services import day_planning_service as day_svc
+from app.services import schedule_service as sched_svc
 from io import BytesIO
 import pandas as pd
 
@@ -34,11 +36,15 @@ async def admin_upload_schedule(file: UploadFile = File(...), db: Session = Depe
 )
 def admin_plan_day(request: schemas.DayPlanCreateRequest, db: Session = Depends(get_db)):
     try:
-        ds = crud.plan_day_schedule(db, request)
+        ds = day_svc.plan_day_schedule(db, request)
         if request.auto_vacant_remove:
-            crud.replace_vacant_auto(db, ds.id)
-        reasons = crud.get_last_plan_debug(ds.id, clear=True) if request.debug else None
-        return crud.get_day_schedule(db, request.date, request.group_name, reasons)
+            day_svc.replace_vacant_auto(db, ds.id)
+        try:
+            from app.services import crud as _legacy_crud
+            reasons = _legacy_crud.get_last_plan_debug(ds.id, clear=True) if request.debug else None
+        except Exception:
+            reasons = None
+        return day_svc.get_day_schedule(db, request.date, request.group_name, reasons)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -57,11 +63,11 @@ def admin_approve_day(
 ):
     try:
         if enforce_no_blockers:
-            pre = crud.analyze_day_schedule(db, day_id, group_name=group_name)
+            pre = day_svc.analyze_day_schedule(db, day_id, group_name=group_name)
             if pre.get("blockers_count", 0) > 0:
                 raise ValueError("Approval blocked: blockers present. Request report via /schedule/day/{day_id}/report")
-        result = crud.approve_day_schedule(db, day_id, group_name=group_name, record_progress=record_progress)
-        result["report"] = crud.analyze_day_schedule(db, day_id, group_name=group_name)
+        result = day_svc.approve_day_schedule(db, day_id, group_name=group_name, record_progress=record_progress)
+        result["report"] = day_svc.analyze_day_schedule(db, day_id, group_name=group_name)
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -74,7 +80,7 @@ def admin_approve_day(
 )
 def admin_replace_vacant_auto(day_id: int, db: Session = Depends(get_db)):
     try:
-        return crud.replace_vacant_auto(db, day_id)
+        return day_svc.replace_vacant_auto(db, day_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -86,7 +92,7 @@ def admin_replace_vacant_auto(day_id: int, db: Session = Depends(get_db)):
 )
 def admin_replace_entry_manual(req: schemas.ReplaceEntryManualRequest, db: Session = Depends(get_db)):
     try:
-        return crud.replace_entry_manual(db, req.entry_id, req.teacher_name)
+        return day_svc.replace_entry_manual(db, req.entry_id, req.teacher_name)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -98,7 +104,7 @@ def admin_replace_entry_manual(req: schemas.ReplaceEntryManualRequest, db: Sessi
 )
 def admin_update_entry_manual(req: schemas.UpdateEntryManualRequest, db: Session = Depends(get_db)):
     try:
-        return crud.update_entry_manual(
+        return day_svc.update_entry_manual(
             db,
             req.entry_id,
             teacher_name=req.teacher_name,
@@ -116,7 +122,7 @@ def admin_update_entry_manual(req: schemas.UpdateEntryManualRequest, db: Session
 )
 def admin_bulk_update_strict(day_id: int, req: schemas.BulkUpdateStrictRequest, db: Session = Depends(get_db)):
     try:
-        result = crud.bulk_update_day_entries_strict(db, day_id, req.items, dry_run=bool(req.dry_run))
+        result = day_svc.bulk_update_day_entries_strict(db, day_id, req.items, dry_run=bool(req.dry_run))
         return schemas.BulkUpdateStrictResponse(
             updated=result["updated"],
             skipped=result["skipped"],
@@ -144,10 +150,9 @@ def admin_generate_semester(request: schemas.GenerateScheduleRequest, background
             background.add_task(_background_generate_semester, job_id, request)
             return {"job_id": job_id, "status": "accepted"}
         db = SessionLocal()
-        gens = crud.generate_schedule(db, request)
-        resp = [crud.get_generated_schedule(db, g.id) for g in gens]
+        gens = sched_svc.generate_schedule(db, request)
+        resp = [sched_svc.get_generated_schedule(db, g.id) for g in gens]
         db.close()
         return resp
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-

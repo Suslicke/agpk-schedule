@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.database import init_db
-from app.api.routers import schedule, upload, progress, dictionary, admin
+from app.api.routers import schedule, upload, progress, dictionary, admin, export, analytics
 from app.core.config import settings
 from app.core.logging_config import setup_logging, RequestIdMiddleware
 
@@ -44,6 +44,8 @@ app.include_router(upload.router)
 app.include_router(progress.router)
 app.include_router(dictionary.router)
 app.include_router(admin.router)
+app.include_router(export.router)
+app.include_router(analytics.router)
 
 
 @app.get("/")

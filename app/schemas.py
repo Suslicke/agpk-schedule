@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict
 from enum import Enum
 from datetime import date
 
@@ -58,6 +58,13 @@ class GenerateScheduleRequest(BaseModel):
     enable_shifts: Optional[bool] = True
     # If true (default), run generation in background and return job id immediately
     async_mode: Optional[bool] = True
+    # Optional overrides for generation semantics (fallback to settings if not provided)
+    # If True, treats imported total_hours as annual and halves them for this run
+    total_hours_is_annual: Optional[bool] = None
+    # Override base date to compute even/odd weeks (YYYY-MM-DD)
+    parity_base_date: Optional[date] = None
+    # Override pair size in academic hours for this run (default from settings)
+    pair_size_academic_hours: Optional[int] = None
 
 
 class GenerateAllScheduleRequest(BaseModel):
@@ -231,6 +238,14 @@ class DayPlanResponse(BaseModel):
     approved_hours: float
     # Optional debug notes (why not more pairs etc.)
     reasons: Optional[List[str]] = None
+    # Reference weekly plan for this date (same shape as entries, without status)
+    plan_entries: Optional[List[DayPlanEntry]] = None
+    # Differences vs weekly plan for this date
+    differences: Optional[List[dict]] = None
+    diff_counters: Optional[dict] = None
+    # Aggregated summaries for convenience
+    group_hours_summary: Optional[List[dict]] = None  # [{group_name, actual_pairs, plan_pairs, delta_pairs, actual_hours_AH, plan_hours_AH, delta_hours_AH}]
+    subject_hours_summary: Optional[List[dict]] = None  # [{group_name, subject_name, actual_pairs, plan_pairs, delta_pairs, actual_hours_AH, plan_hours_AH, delta_hours_AH}]
 
     class Config:
         from_attributes = True
@@ -377,3 +392,150 @@ class ProgressTimeseriesPoint(BaseModel):
 
 class ProgressTimeseriesResponse(BaseModel):
     points: List[ProgressTimeseriesPoint]
+
+
+class ExportDayRequest(BaseModel):
+    date: date
+    group_name: Optional[str] = None
+    groups: Optional[List[str]] = None
+
+
+class ExportScheduleRequest(BaseModel):
+    # Range or period-based
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    period: Optional[str] = None  # week | month | semester
+    anchor_date: Optional[date] = None
+    semester_name: Optional[str] = None
+    # Filters
+    groups: Optional[List[str]] = None
+    # View and formatting
+    view: Optional[str] = "all"  # plan | actual | diff | all
+    split_by_group: Optional[bool] = False
+
+
+# --- Day entry room swap ---
+class RoomSwapChoice(BaseModel):
+    entry_id: int
+    room_name: str
+
+
+class SwapRoomRequest(BaseModel):
+    desired_room_name: str
+    choices: Optional[List[RoomSwapChoice]] = None
+    dry_run: Optional[bool] = False
+
+
+class RoomSwapConflictItem(BaseModel):
+    entry_id: int
+    group_name: str
+    subject_name: str
+    teacher_name: Optional[str] = None
+    room_name: str
+    alternatives: List[str]
+
+
+class RoomSwapPlanResponse(BaseModel):
+    entry_id: int
+    date: date
+    start_time: str
+    end_time: str
+    desired_room_name: str
+    is_free: bool
+    conflicts: List[RoomSwapConflictItem]
+    can_auto_resolve: bool
+
+
+# --- Analytics ---
+class AnalyticsFilter(BaseModel):
+    start_date: date
+    end_date: date
+    groups: Optional[List[str]] = None
+    teachers: Optional[List[str]] = None
+    subjects: Optional[List[str]] = None
+    rooms: Optional[List[str]] = None
+    # Count "actual" только по утвержденным записям дневного плана
+    only_approved: Optional[bool] = False
+
+
+class TeacherSummaryItem(BaseModel):
+    teacher_name: str
+    group_name: str
+    subject_name: str
+    planned_pairs: int
+    planned_hours_AH: float
+    actual_pairs: int  # from day plan entries (approved/replaced)
+    actual_hours_AH: float
+    total_plan_hours_AH: float
+    percent_assigned: float  # planned_hours / total_plan_hours
+    percent_actual: float  # actual_hours / total_plan_hours
+    manual_completed_hours_AH: float
+    effective_hours_AH: float  # actual_hours + manual_completed; capped by total_plan_hours
+    percent_effective: float
+
+
+class GroupSubjectSummaryItem(BaseModel):
+    group_name: str
+    subject_name: str
+    planned_pairs: int
+    planned_hours_AH: float
+    actual_pairs: int
+    actual_hours_AH: float
+    total_plan_hours_AH: float
+    percent_assigned: float
+    percent_actual: float
+    manual_completed_hours_AH: float
+    effective_hours_AH: float
+    percent_effective: float
+
+
+class RoomSummaryItem(BaseModel):
+    room_name: str
+    planned_pairs: int
+    actual_pairs: int
+    planned_hours_AH: float
+    actual_hours_AH: float
+
+
+class HeatmapResponse(BaseModel):
+    days: List[str]
+    slots: List[str]
+    matrix: List[List[int]]  # rows=days, cols=slots
+    totals_by_day: List[int]
+    totals_by_slot: List[int]
+
+
+class DistributionItem(BaseModel):
+    name: str
+    planned_pairs: int
+    actual_pairs: int
+    planned_hours_AH: float
+    actual_hours_AH: float
+
+
+class ScheduleTimeseriesPoint(BaseModel):
+    date: date
+    planned_pairs: int
+    actual_pairs: int
+    planned_hours_AH: float
+    actual_hours_AH: float
+
+
+class TeacherSummaryResponse(BaseModel):
+    items: List[TeacherSummaryItem]
+
+
+class GroupSummaryResponse(BaseModel):
+    items: List[GroupSubjectSummaryItem]
+
+
+class RoomSummaryResponse(BaseModel):
+    items: List[RoomSummaryItem]
+
+
+class DistributionResponse(BaseModel):
+    items: List[DistributionItem]
+
+
+class ScheduleTimeseriesResponse(BaseModel):
+    points: List[ScheduleTimeseriesPoint]
