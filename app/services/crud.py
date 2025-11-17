@@ -987,11 +987,15 @@ def get_generated_schedule(db: Session, gen_id: int):
                 )
                 filtered_daily_schedule = d.daily_schedule
             if filtered_daily_schedule:
+                # Get all teachers for this item (supports multiple teachers)
+                teachers = get_schedule_item_teachers(item)
+                teacher_names_str = "/".join([t.name for t in teachers])
+
                 weekly_distributions[(d.week_start, d.week_end, bool(d.is_even_week))].append({
                     "hours_even": d.hours_even,
                     "hours_odd": d.hours_odd,
                     "subject_name": item.subject.name,
-                    "teacher_name": item.teacher.name,
+                    "teacher_name": teacher_names_str,  # All teachers joined with "/"
                     "room_name": item.room.name,
                     "group_name": item.group.name,
                     "daily_schedule": [
@@ -1020,7 +1024,8 @@ def get_generated_schedule(db: Session, gen_id: int):
                         start_time=slot["start_time"],
                         end_time=slot["end_time"],
                         subject_name=slot["subject_name"],
-                        teacher_name=slot["teacher_name"],
+                        # Support both old format (teacher_name) and new format (teacher_names list)
+                        teacher_name=slot.get("teacher_name") or "/".join(slot.get("teacher_names", [])),
                         room_name=slot["room_name"],
                         group_name=slot.get("group_name")
                     )
