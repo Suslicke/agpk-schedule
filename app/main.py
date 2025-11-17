@@ -27,6 +27,7 @@ app = FastAPI(
     title="Schedule Management API",
     description="API для генерации, планирования и учета расписания",
     openapi_tags=tags_metadata,
+    root_path="/api",
 )
 
 app.add_middleware(
