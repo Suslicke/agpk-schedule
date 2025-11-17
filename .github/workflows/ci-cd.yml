@@ -182,7 +182,7 @@ jobs:
 
           docker load -i schedule-api.tar
           docker compose run --rm api alembic upgrade head || echo "No migrations step configured"
-          docker compose up -d api
+          docker compose up -d --force-recreate api
           docker image prune -f
 
           sleep 5
