@@ -51,6 +51,7 @@ Core endpoints
   - `POST /schedule/day/{day_id}/replace_vacant_auto` — (protected) run auto-replacement manually.
   - `POST /schedule/day/replace_entry_manual` — (protected) manually set a teacher for an entry. Response includes a per-group validation `report`.
   - `POST /schedule/day/update_entry_manual` — (protected) advanced manual update of an entry (teacher/subject/room) with validation report.
+    - Передайте `room_name: ""` (пустая строка), чтобы очистить аудиторию (поставится placeholder). Такие записи помечаются блокером `room_missing` и не допускаются к апруву, пока не назначена реальная аудитория.
   - `GET /schedule/day/entry_lookup?date=YYYY-MM-DD|&day_id=...&group_name=&start_time=&subject_name=&room_name=&teacher_name=` — быстрый поиск `entry_id` по фильтрам.
   - `POST /schedule/day/{day_id}/bulk_update_strict` — (protected) массовое обновление всего дня (строгое):
     - Тело: `{ items: [{ entry_id | group_name+start_time(+subject_name), update_teacher_name?, update_subject_name?, update_room_name? }], dry_run?: false }`
@@ -125,8 +126,13 @@ Export
   - Разнести по листам: `split_by_group=true` — отдельные листы Plan/Actual/Diff для каждой группы
   - Подсветка отличий в листах Diff (added — зелёным, removed — красным, changed — жёлтым)
   - Быстрая ручная правка и замены:
-    - `GET /schedule/day/entry/{entry_id}/options` — подсказки для замены: свободные преподаватели (приоритезированы по маппингу группы/предмета) и свободные аудитории на этот слот.
+    - `GET /schedule/day/entry/{entry_id}/options` — подсказки для замены: выдаются как свободные, так и занятые варианты.
+      - Преподаватели приоритезируются по маппингу (группа+предмет → группа → все). Поля:
+        - `teacher_name`, `source` (`group_subject_mapping` | `group_mapping` | `free` | `busy`), `busy: boolean`.
+        - Если `busy: true`: `conflicts_count`, `busy_groups: string[]`, `conflicts: [{ entry_id, group_name, subject_name, room_name }]`.
+      - Аудитории: `room_name`, `capacity`, `busy` и, если занята, `conflicts_count`, `used`, `occupied_by: [{ entry_id, group_name, subject_name, teacher_name }]`.
     - `GET /schedule/day/entry/{entry_id}/room_swap_plan?desired_room_name=...` — план “освобождения” занятой аудитории: кто сейчас сидит и куда их можно переставить; флаг `can_auto_resolve` если у всех есть альтернатива.
+    - `POST /schedule/day/entry/{entry_id}/clear_room` — жёстко очистить аудиторию у пары (ставится спец. placeholder). В отчёте дня такая пара помечается блокером `room_missing`, апрув блокируется.
     - `POST /schedule/day/entry/{entry_id}/swap_room` — выполнить перестановку аудиторий (каскадно):
       - Тело: `{ "desired_room_name": "ГК205", "choices": [{ "entry_id": 123, "room_name": "ГК206" }], "dry_run": false }`
       - Если `choices` не задан — система возьмёт первую подходящую альтернативу для каждого конфликта; `dry_run: true` — только показать, что изменится.

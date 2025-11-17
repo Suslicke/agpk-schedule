@@ -38,6 +38,18 @@ def analyze_day_schedule(db: Session, day_schedule_id: int, group_name: Optional
 
 
 def approve_day_schedule(db: Session, day_schedule_id: int, group_name: Optional[str] = None, record_progress: bool = True) -> Dict:
+    ds = db.query(models.DaySchedule).filter(models.DaySchedule.id == day_schedule_id).first()
+    if not ds:
+        raise ValueError("Day schedule not found")
+    # Block approval if any entry has an empty/placeholder room
+    for e in ds.entries:
+        if group_name:
+            g = db.query(models.Group).get(e.group_id)
+            if not g or g.name != group_name:
+                continue
+        r = db.query(models.Room).get(e.room_id) if e.room_id else None
+        if (r is None) or crud._is_placeholder_room_name(r.name if r else None):
+            raise ValueError("Approval blocked: entries with empty room present")
     return crud.approve_day_schedule(db, day_schedule_id, group_name, record_progress)
 
 
@@ -50,25 +62,85 @@ def get_entry_replacement_options(db: Session, entry_id: int, *, limit_teachers:
         raise ValueError("Day schedule not found")
     group = db.query(models.Group).get(e.group_id)
     subject = db.query(models.Subject).get(e.subject_id)
-    # Teachers: priority by mapping for (group, subject) -> (group, any subject) -> any free
+    # Teachers: priority by mapping for (group, subject) -> (group, any subject) -> any teacher,
+    # return both free and busy options (busy flagged) so UI can trigger swap plans.
     teacher_opts: list[dict] = []
     seen_teachers: set[int] = set()
-    # 1) Group-Subject mapping
+
+    def _append_teacher_option(t: models.Teacher, source: str):
+        nonlocal teacher_opts
+        if t.id in seen_teachers:
+            return False
+        is_free = _teacher_is_free(db, t.id, ds.date, e.start_time, e.end_time, exclude_entry_id=e.id)
+        # If free, append immediately
+        if is_free:
+            teacher_opts.append({
+                "teacher_name": t.name,
+                "source": source,
+                "busy": False,
+            })
+            seen_teachers.add(t.id)
+            return True
+        return False
+
+    def _append_teacher_option_busy(t: models.Teacher, source: str):
+        nonlocal teacher_opts
+        if t.id in seen_teachers:
+            return False
+        # Count conflicts at this slot for this teacher
+        conflicts = _list_conflicts_for_teacher(db, ds.date, e.start_time, t.id, exclude_entry_id=e.id)
+        # Build details to show which groups occupy this teacher now
+        conflict_details: list[dict] = []
+        busy_groups: set[str] = set()
+        for c in conflicts:
+            g = db.query(models.Group).get(c.group_id)
+            s = db.query(models.Subject).get(c.subject_id)
+            r = db.query(models.Room).get(c.room_id) if c.room_id else None
+            gname = g.name if g else str(c.group_id)
+            busy_groups.add(gname)
+            conflict_details.append({
+                "entry_id": c.id,
+                "group_name": gname,
+                "subject_name": s.name if s else str(c.subject_id),
+                "room_name": (r.name if r else None),
+            })
+        teacher_opts.append({
+            "teacher_name": t.name,
+            "source": source,
+            "busy": True,
+            "conflicts_count": len(conflicts),
+            "busy_groups": sorted(list(busy_groups)),
+            "conflicts": conflict_details,
+        })
+        seen_teachers.add(t.id)
+        return True
+
+    # 1) Group-Subject mapping (free first, then busy)
     mapped_same = (
         db.query(models.GroupTeacherSubject)
         .filter(models.GroupTeacherSubject.group_id == e.group_id, models.GroupTeacherSubject.subject_id == e.subject_id)
         .all()
     )
+    # Free first
     for l in mapped_same:
+        if limit_teachers and len(teacher_opts) >= limit_teachers:
+            break
         t = db.query(models.Teacher).get(l.teacher_id)
-        if not t or t.id in seen_teachers:
+        if not t:
             continue
-        if _teacher_is_free(db, t.id, ds.date, e.start_time, e.end_time, exclude_entry_id=e.id):
-            teacher_opts.append({"teacher_name": t.name, "source": "group_subject_mapping"})
-            seen_teachers.add(t.id)
+        if _append_teacher_option(t, "group_subject_mapping"):
+            continue
+    # Then busy if limit not reached
+    if not limit_teachers or len(teacher_opts) < limit_teachers:
+        for l in mapped_same:
             if limit_teachers and len(teacher_opts) >= limit_teachers:
                 break
-    # 2) Group-any mapping
+            t = db.query(models.Teacher).get(l.teacher_id)
+            if not t:
+                continue
+            _append_teacher_option_busy(t, "group_subject_mapping")
+
+    # 2) Group-any mapping (free first, then busy)
     if not limit_teachers or len(teacher_opts) < limit_teachers:
         mapped_any = (
             db.query(models.GroupTeacherSubject)
@@ -76,37 +148,111 @@ def get_entry_replacement_options(db: Session, entry_id: int, *, limit_teachers:
             .all()
         )
         for l in mapped_any:
-            if l.teacher_id in seen_teachers:
-                continue
+            if limit_teachers and len(teacher_opts) >= limit_teachers:
+                break
             t = db.query(models.Teacher).get(l.teacher_id)
             if not t:
                 continue
-            if _teacher_is_free(db, t.id, ds.date, e.start_time, e.end_time, exclude_entry_id=e.id):
-                teacher_opts.append({"teacher_name": t.name, "source": "group_mapping"})
-                seen_teachers.add(t.id)
+            if _append_teacher_option(t, "group_mapping"):
+                continue
+        if not limit_teachers or len(teacher_opts) < limit_teachers:
+            for l in mapped_any:
                 if limit_teachers and len(teacher_opts) >= limit_teachers:
                     break
-    # 3) Any free teacher
+                t = db.query(models.Teacher).get(l.teacher_id)
+                if not t:
+                    continue
+                _append_teacher_option_busy(t, "group_mapping")
+
+    # 3) Any teacher (free first, then busy)
     if not limit_teachers or len(teacher_opts) < limit_teachers:
         all_teachers = db.query(models.Teacher).all()
         for t in all_teachers:
+            if limit_teachers and len(teacher_opts) >= limit_teachers:
+                break
             if t.id in seen_teachers:
                 continue
-            if _teacher_is_free(db, t.id, ds.date, e.start_time, e.end_time, exclude_entry_id=e.id):
-                teacher_opts.append({"teacher_name": t.name, "source": "free"})
-                seen_teachers.add(t.id)
+            # Keep backward-compatible source label for free-any
+            if _append_teacher_option(t, "free"):
+                continue
+        if not limit_teachers or len(teacher_opts) < limit_teachers:
+            for t in all_teachers:
                 if limit_teachers and len(teacher_opts) >= limit_teachers:
                     break
+                if t.id in seen_teachers:
+                    continue
+                _append_teacher_option_busy(t, "busy")
 
-    # Rooms: any room with available capacity
+    # Rooms: first free by capacity, then busy (flagged) so UI can trigger swap
     room_opts: list[dict] = []
     all_rooms = db.query(models.Room).all()
+    # Free rooms first
     for r in all_rooms:
+        if limit_rooms and len(room_opts) >= limit_rooms:
+            break
+        # Skip placeholder room (represents 'no room')
+        try:
+            if crud._is_placeholder_room_name(r.name):
+                continue
+        except Exception:
+            pass
         if _room_has_capacity(db, ds.date, e.start_time, r.id, exclude_entry_id=e.id):
             cap = 4 if (r and "Спортзал" in r.name) else 1
-            room_opts.append({"room_name": r.name, "capacity": cap})
-            if limit_rooms and len(room_opts) >= limit_rooms:
-                break
+            room_opts.append({"room_name": r.name, "capacity": cap, "busy": False})
+    # Then busy rooms if limit not reached
+    if not limit_rooms or len(room_opts) < limit_rooms:
+        # Count current occupants per room at this time
+        ds_same_day = db.query(models.DaySchedule).filter(models.DaySchedule.date == ds.date).first()
+        if ds_same_day:
+            # Build a quick map room_id -> used count (excluding this entry)
+            q = (
+                db.query(models.DayScheduleEntry)
+                .filter(
+                    models.DayScheduleEntry.day_schedule_id == ds_same_day.id,
+                    models.DayScheduleEntry.start_time == e.start_time,
+                )
+            )
+            if e.id:
+                q = q.filter(models.DayScheduleEntry.id != e.id)
+            entries_same_slot = q.all()
+            by_room: dict[int, int] = defaultdict(int)
+            entries_by_room: dict[int, list[models.DayScheduleEntry]] = defaultdict(list)
+            for ent in entries_same_slot:
+                if ent.room_id is not None:
+                    by_room[ent.room_id] += 1
+                    entries_by_room[ent.room_id].append(ent)
+            for r in all_rooms:
+                if limit_rooms and len(room_opts) >= limit_rooms:
+                    break
+                try:
+                    if crud._is_placeholder_room_name(r.name):
+                        continue
+                except Exception:
+                    pass
+                if _room_has_capacity(db, ds.date, e.start_time, r.id, exclude_entry_id=e.id):
+                    continue  # already included as free
+                used = by_room.get(r.id, 0)
+                cap = 4 if (r and "Спортзал" in r.name) else 1
+                # Prepare occupant details: which groups now occupy the room
+                occ_details: list[dict] = []
+                for c in entries_by_room.get(r.id, []):
+                    g = db.query(models.Group).get(c.group_id)
+                    s = db.query(models.Subject).get(c.subject_id)
+                    tchr = db.query(models.Teacher).get(c.teacher_id) if c.teacher_id else None
+                    occ_details.append({
+                        "entry_id": c.id,
+                        "group_name": g.name if g else str(c.group_id),
+                        "subject_name": s.name if s else str(c.subject_id),
+                        "teacher_name": (tchr.name if tchr else None),
+                    })
+                room_opts.append({
+                    "room_name": r.name,
+                    "capacity": cap,
+                    "busy": True,
+                    "used": used,
+                    "conflicts_count": used,  # occupants at this slot
+                    "occupied_by": occ_details,
+                })
 
     return {
         "entry_id": e.id,
@@ -248,6 +394,239 @@ def execute_room_swap(db: Session, entry_id: int, desired_room_name: str, *, cho
     e.status = "replaced_manual"
     db.add(e)
     changes.append({"entry_id": e.id, "old_room": old_room_name, "new_room": desired_room.name})
+    db.commit()
+    report = analyze_day_schedule(db, ds.id)
+    return {"changed": changes, "report": report}
+
+
+# --- Teacher swap (force replace with conflict resolution) ---
+def _list_conflicts_for_teacher(db: Session, date_: date, start_time: str, teacher_id: int, *, exclude_entry_id: int | None = None):
+    ds = db.query(models.DaySchedule).filter(models.DaySchedule.date == date_).first()
+    if not ds:
+        return []
+    q = (
+        db.query(models.DayScheduleEntry)
+        .filter(models.DayScheduleEntry.day_schedule_id == ds.id)
+        .filter(models.DayScheduleEntry.teacher_id == teacher_id)
+        .filter(models.DayScheduleEntry.start_time == start_time)
+    )
+    if exclude_entry_id:
+        q = q.filter(models.DayScheduleEntry.id != exclude_entry_id)
+    return q.all()
+
+
+def propose_teacher_swap(db: Session, entry_id: int, desired_teacher_name: str, *, limit_alternatives: int = 5) -> schemas.TeacherSwapPlanResponse:
+    e = db.query(models.DayScheduleEntry).filter(models.DayScheduleEntry.id == entry_id).first()
+    if not e:
+        raise ValueError("Entry not found")
+    ds = db.query(models.DaySchedule).get(e.day_schedule_id)
+    if not ds:
+        raise ValueError("Day schedule not found")
+    teacher = db.query(models.Teacher).filter(models.Teacher.name == desired_teacher_name).first()
+    if not teacher:
+        raise ValueError("Teacher not found")
+    # Determine subject to be set with this teacher (mapping preferred)
+    link = (
+        db.query(models.GroupTeacherSubject)
+        .filter(models.GroupTeacherSubject.group_id == e.group_id, models.GroupTeacherSubject.teacher_id == teacher.id)
+        .first()
+    )
+    desired_subject_name = None
+    if link:
+        subj = db.query(models.Subject).get(link.subject_id)
+        desired_subject_name = subj.name if subj else None
+    else:
+        subj = db.query(models.Subject).get(e.subject_id)
+        desired_subject_name = subj.name if subj else None
+
+    # If teacher free -> no conflicts
+    if _teacher_is_free(db, teacher.id, ds.date, e.start_time, e.end_time, exclude_entry_id=e.id):
+        return schemas.TeacherSwapPlanResponse(
+            entry_id=e.id,
+            date=ds.date,
+            start_time=e.start_time,
+            end_time=e.end_time,
+            desired_teacher_name=teacher.name,
+            desired_subject_name=desired_subject_name,
+            is_free=True,
+            conflicts=[],
+            can_auto_resolve=True,
+        )
+
+    # Otherwise list conflicts for this teacher at this slot and propose alternatives
+    conflicts = _list_conflicts_for_teacher(db, ds.date, e.start_time, teacher.id, exclude_entry_id=e.id)
+    conflict_items: list[schemas.TeacherSwapConflictItem] = []
+    can_auto = True
+    for c in conflicts:
+        g = db.query(models.Group).get(c.group_id)
+        s = db.query(models.Subject).get(c.subject_id)
+        t = db.query(models.Teacher).get(c.teacher_id) if c.teacher_id else None
+        # Build alternatives: prefer mapping for (group, subject), then group-any, then any free
+        alt_teachers: list[str] = []
+        seen: set[int] = set([teacher.id])  # don't suggest the desired teacher back
+        # 1) Group-Subject mapping
+        mapped_same = (
+            db.query(models.GroupTeacherSubject)
+            .filter(models.GroupTeacherSubject.group_id == c.group_id, models.GroupTeacherSubject.subject_id == c.subject_id)
+            .all()
+        )
+        for l in mapped_same:
+            if l.teacher_id in seen:
+                continue
+            cand = db.query(models.Teacher).get(l.teacher_id)
+            if not cand:
+                continue
+            if _teacher_is_free(db, cand.id, ds.date, c.start_time, c.end_time, exclude_entry_id=c.id):
+                alt_teachers.append(cand.name)
+                seen.add(cand.id)
+                if limit_alternatives and len(alt_teachers) >= limit_alternatives:
+                    break
+        # 2) Group-any mapping
+        if not limit_alternatives or len(alt_teachers) < limit_alternatives:
+            mapped_any = db.query(models.GroupTeacherSubject).filter(models.GroupTeacherSubject.group_id == c.group_id).all()
+            for l in mapped_any:
+                if l.teacher_id in seen:
+                    continue
+                cand = db.query(models.Teacher).get(l.teacher_id)
+                if not cand:
+                    continue
+                if _teacher_is_free(db, cand.id, ds.date, c.start_time, c.end_time, exclude_entry_id=c.id):
+                    alt_teachers.append(cand.name)
+                    seen.add(cand.id)
+                    if limit_alternatives and len(alt_teachers) >= limit_alternatives:
+                        break
+        # 3) Any free teacher
+        if not limit_alternatives or len(alt_teachers) < limit_alternatives:
+            for cand in db.query(models.Teacher).all():
+                if cand.id in seen:
+                    continue
+                if _teacher_is_free(db, cand.id, ds.date, c.start_time, c.end_time, exclude_entry_id=c.id):
+                    alt_teachers.append(cand.name)
+                    seen.add(cand.id)
+                    if limit_alternatives and len(alt_teachers) >= limit_alternatives:
+                        break
+        if not alt_teachers:
+            can_auto = False
+        conflict_items.append(
+            schemas.TeacherSwapConflictItem(
+                entry_id=c.id,
+                group_name=g.name if g else str(c.group_id),
+                subject_name=s.name if s else str(c.subject_id),
+                teacher_name=(t.name if t else None),
+                alternatives=alt_teachers,
+            )
+        )
+
+    return schemas.TeacherSwapPlanResponse(
+        entry_id=e.id,
+        date=ds.date,
+        start_time=e.start_time,
+        end_time=e.end_time,
+        desired_teacher_name=teacher.name,
+        desired_subject_name=desired_subject_name,
+        is_free=False,
+        conflicts=conflict_items,
+        can_auto_resolve=can_auto,
+    )
+
+
+def execute_teacher_swap(
+    db: Session,
+    entry_id: int,
+    desired_teacher_name: str,
+    *,
+    choices: List[schemas.TeacherSwapChoice] | None = None,
+    dry_run: bool = False,
+) -> Dict:
+    plan = propose_teacher_swap(db, entry_id, desired_teacher_name)
+    e = db.query(models.DayScheduleEntry).get(entry_id)
+    ds = db.query(models.DaySchedule).get(e.day_schedule_id)
+    desired_teacher = db.query(models.Teacher).filter(models.Teacher.name == desired_teacher_name).first()
+    if not desired_teacher:
+        raise ValueError("Teacher not found")
+
+    # Helper to maybe align subject for an entry based on GroupTeacherSubject mapping
+    def _align_subject_for_entry(entry: models.DayScheduleEntry, teacher_id: int) -> int:
+        link = (
+            db.query(models.GroupTeacherSubject)
+            .filter(models.GroupTeacherSubject.group_id == entry.group_id, models.GroupTeacherSubject.teacher_id == teacher_id)
+            .first()
+        )
+        return link.subject_id if link else entry.subject_id
+
+    changes: list[dict] = []
+    # If free, simple assign
+    if plan.is_free:
+        old_t = db.query(models.Teacher).get(e.teacher_id).name if e.teacher_id else None
+        old_s = db.query(models.Subject).get(e.subject_id).name if e.subject_id else None
+        new_subject_id = (
+            db.query(models.Subject).filter(models.Subject.name == (plan.desired_subject_name or "")).first().id
+            if plan.desired_subject_name
+            else _align_subject_for_entry(e, desired_teacher.id)
+        )
+        if dry_run:
+            return {
+                "changed": [
+                    {"entry_id": e.id, "old_teacher": old_t, "new_teacher": desired_teacher.name, "old_subject": old_s, "new_subject": plan.desired_subject_name}
+                ],
+                "dry_run": True,
+            }
+        e.teacher_id = desired_teacher.id
+        e.subject_id = new_subject_id
+        e.status = "replaced_manual"
+        db.add(e)
+        db.commit()
+        report = analyze_day_schedule(db, ds.id, group_name=db.query(models.Group).get(e.group_id).name)
+        return {
+            "changed": [
+                {"entry_id": e.id, "old_teacher": old_t, "new_teacher": desired_teacher.name, "old_subject": old_s, "new_subject": db.query(models.Subject).get(new_subject_id).name if new_subject_id else None}
+            ],
+            "report": report,
+        }
+
+    # Need to reassign conflicts first
+    mapping: dict[int, str] = {}
+    if choices:
+        for ch in choices:
+            mapping[ch.entry_id] = ch.teacher_name
+
+    # Reassign each conflicting entry to a selected or first alternative teacher
+    for c in plan.conflicts:
+        new_teacher_name = mapping.get(c.entry_id)
+        if not new_teacher_name:
+            if not c.alternatives:
+                raise ValueError(f"No alternative teacher for entry {c.entry_id}")
+            new_teacher_name = c.alternatives[0]
+        new_teacher = db.query(models.Teacher).filter(models.Teacher.name == new_teacher_name).first()
+        if not new_teacher:
+            raise ValueError(f"Teacher not found: {new_teacher_name}")
+        ce = db.query(models.DayScheduleEntry).get(c.entry_id)
+        # Double-check availability
+        if not _teacher_is_free(db, new_teacher.id, ds.date, ce.start_time, ce.end_time, exclude_entry_id=ce.id):
+            raise ValueError(f"Teacher not available now: {new_teacher_name}")
+        new_subject_id = _align_subject_for_entry(ce, new_teacher.id)
+        if dry_run:
+            changes.append({"entry_id": ce.id, "old_teacher": c.teacher_name, "new_teacher": new_teacher.name})
+        else:
+            ce.teacher_id = new_teacher.id
+            ce.subject_id = new_subject_id
+            ce.status = "replaced_manual"
+            db.add(ce)
+            changes.append({"entry_id": ce.id, "old_teacher": c.teacher_name, "new_teacher": new_teacher.name})
+
+    # Assign desired teacher to the main entry
+    old_t = db.query(models.Teacher).get(e.teacher_id).name if e.teacher_id else None
+    old_s = db.query(models.Subject).get(e.subject_id).name if e.subject_id else None
+    new_subject_id = _align_subject_for_entry(e, desired_teacher.id)
+    if dry_run:
+        changes.append({"entry_id": e.id, "old_teacher": old_t, "new_teacher": desired_teacher.name})
+        return {"changed": changes, "dry_run": True}
+
+    e.teacher_id = desired_teacher.id
+    e.subject_id = new_subject_id
+    e.status = "replaced_manual"
+    db.add(e)
+    changes.append({"entry_id": e.id, "old_teacher": old_t, "new_teacher": desired_teacher.name})
     db.commit()
     report = analyze_day_schedule(db, ds.id)
     return {"changed": changes, "report": report}
@@ -469,13 +848,24 @@ def analyze_day_schedule(db: Session, day_schedule_id: int, group_name: str | No
         if target_group_ids and e.group_id not in target_group_ids:
             continue
         teacher = db.query(models.Teacher).get(e.teacher_id) if e.teacher_id else None
-        room = db.query(models.Room).get(e.room_id)
+        room = db.query(models.Room).get(e.room_id) if e.room_id else None
         grp = db.query(models.Group).get(e.group_id)
         key_t = (e.start_time, e.teacher_id or -1)
         key_r = (e.start_time, e.room_id)
         key_g = (e.group_id, e.start_time)
         teacher_slots[key_t].append(e)
-        room_slots[key_r].append(e)
+        # Treat placeholder/empty room as missing: report blocker and do not include in capacity slots
+        is_empty_room = (room is None) or crud._is_placeholder_room_name(room.name if room else None)
+        if is_empty_room:
+            issues.append({
+                "code": "room_missing",
+                "severity": "blocker",
+                "message": f"Группа {grp.name}: не назначена аудитория для {e.start_time}",
+                "entry_ids": [e.id],
+                "group_name": grp.name,
+            })
+        else:
+            room_slots[key_r].append(e)
         group_slots[key_g].append(e)
         per_group_entries[e.group_id].append(e)
         if (teacher is None) or (teacher.name is None) or (crud._is_placeholder_teacher_name(teacher.name)):
@@ -594,18 +984,22 @@ def get_day_schedule(db: Session, date_: date, group_name: str | None = None, re
         if group_name and group.name != group_name:
             continue
         subject = db.query(models.Subject).get(e.subject_id)
-        room = db.query(models.Room).get(e.room_id)
+        room = db.query(models.Room).get(e.room_id) if e.room_id else None
         teacher_name = None
         if e.teacher_id:
             t = db.query(models.Teacher).get(e.teacher_id)
             teacher_name = t.name if t else None
+        # Convert placeholder room to empty string for UI
+        room_name_out = ""
+        if room and not crud._is_placeholder_room_name(room.name):
+            room_name_out = room.name
         entries.append(
             schemas.DayPlanEntry(
                 id=e.id,
                 group_name=group.name,
                 subject_name=subject.name,
                 teacher_name=teacher_name,
-                room_name=room.name,
+                room_name=room_name_out,
                 start_time=e.start_time,
                 end_time=e.end_time,
                 status=e.status,
@@ -768,14 +1162,27 @@ def update_entry_manual(
             subj = crud.get_or_create_subject(db, subject_name)
         e.subject_id = subj.id
         updates["subject_name"] = subj.name
-    if room_name:
-        room = db.query(models.Room).filter(models.Room.name == room_name).first()
-        if not room:
-            room = crud.get_or_create_room(db, room_name)
-        if not _room_has_capacity(db, ds.date, e.start_time, room.id, exclude_entry_id=e.id):
-            raise ValueError("Room is not available at this time")
-        e.room_id = room.id
-        updates["room_name"] = room.name
+    if room_name is not None:
+        # Empty string means clear room (set to placeholder)
+        rn = room_name.strip()
+        if rn == "":
+            empty = crud.get_or_create_empty_room(db)
+            e.room_id = empty.id
+            updates["room_name"] = ""
+        else:
+            room = db.query(models.Room).filter(models.Room.name == rn).first()
+            if not room:
+                room = crud.get_or_create_room(db, rn)
+            if crud._is_placeholder_room_name(room.name):
+                # Disallow direct setting to placeholder name via regular update
+                empty = crud.get_or_create_empty_room(db)
+                e.room_id = empty.id
+                updates["room_name"] = ""
+            else:
+                if not _room_has_capacity(db, ds.date, e.start_time, room.id, exclude_entry_id=e.id):
+                    raise ValueError("Room is not available at this time")
+                e.room_id = room.id
+                updates["room_name"] = room.name
     if not updates:
         raise ValueError("No changes provided")
     e.status = "replaced_manual"
@@ -788,6 +1195,23 @@ def update_entry_manual(
     }
     report = analyze_day_schedule(db, e.day_schedule_id, group_name=db.query(models.Group).get(e.group_id).name)
     return {"entry_id": e.id, "old": prev, "new": new, "status": e.status, "report": report}
+
+
+def clear_entry_room(db: Session, entry_id: int) -> Dict:
+    e = db.query(models.DayScheduleEntry).filter(models.DayScheduleEntry.id == entry_id).first()
+    if not e:
+        raise ValueError("Entry not found")
+    ds = db.query(models.DaySchedule).get(e.day_schedule_id)
+    if not ds:
+        raise ValueError("Day schedule not found")
+    prev_room = db.query(models.Room).get(e.room_id).name if e.room_id else None
+    empty = crud.get_or_create_empty_room(db)
+    e.room_id = empty.id
+    e.status = "replaced_manual"
+    db.add(e)
+    db.commit()
+    report = analyze_day_schedule(db, ds.id)
+    return {"entry_id": e.id, "old_room": prev_room, "new_room": "", "status": e.status, "report": report}
 
 
 def lookup_day_entries(
@@ -825,6 +1249,10 @@ def lookup_day_entries(
             continue
         if teacher_name and ((not t) or t.name != teacher_name):
             continue
+        # Convert placeholder room to empty string for UI
+        room_name_out = ""
+        if r and not crud._is_placeholder_room_name(r.name):
+            room_name_out = r.name
         result.append(
             schemas.EntryLookupItem(
                 day_id=ds.id,
@@ -833,7 +1261,7 @@ def lookup_day_entries(
                 group_name=g.name if g else str(e.group_id),
                 subject_name=s.name if s else str(e.subject_id),
                 teacher_name=(t.name if t else None),
-                room_name=r.name if r else str(e.room_id),
+                room_name=room_name_out,
                 start_time=e.start_time,
                 end_time=e.end_time,
                 status=e.status,
@@ -1017,25 +1445,280 @@ def bulk_update_day_entries_strict(
     return {"updated": updated, "skipped": skipped, "errors": errors, "results": results, "report": report}
 
 
-def replace_vacant_auto(db: Session, day_schedule_id: int) -> Dict:
-    return crud.replace_vacant_auto(db, day_schedule_id)
-
-
-def replace_entry_manual(db: Session, entry_id: int, teacher_name: str) -> Dict:
-    return crud.replace_entry_manual(db, entry_id, teacher_name)
-
-
-def update_entry_manual(db: Session, entry_id: int, teacher_name: Optional[str] = None, subject_name: Optional[str] = None, room_name: Optional[str] = None) -> Dict:
-    return crud.update_entry_manual(db, entry_id, teacher_name=teacher_name, subject_name=subject_name, room_name=room_name)
-
-
-def lookup_day_entries(db: Session, *, date_: date | None = None, day_id: int | None = None, group_name: str | None = None, start_time: str | None = None, subject_name: str | None = None, room_name: str | None = None, teacher_name: str | None = None):
-    return crud.lookup_day_entries(db, date_=date_, day_id=day_id, group_name=group_name, start_time=start_time, subject_name=subject_name, room_name=room_name, teacher_name=teacher_name)
-
-
-def bulk_update_day_entries_strict(db: Session, day_id: int, items: List[schemas.BulkUpdateEntryStrict], *, dry_run: bool = False) -> Dict:
-    return crud.bulk_update_day_entries_strict(db, day_id, items, dry_run=dry_run)
+# (Removed duplicate wrapper definitions that caused circular recursion with crud)
 
 
 def get_last_plan_debug(day_id: int, clear: bool = True) -> list[str]:
     return crud.get_last_plan_debug(day_id, clear)
+
+
+# --- New: manual add/delete and autofill helpers ---
+def add_day_entry_manual(db: Session, req: schemas.AddEntryManualRequest) -> Dict:
+    ds = db.query(models.DaySchedule).filter(models.DaySchedule.date == req.date).first()
+    if not ds:
+        ds = models.DaySchedule(date=req.date, status="pending")
+        db.add(ds)
+        db.commit()
+        db.refresh(ds)
+    else:
+        if ds.status == "approved":
+            raise ValueError("Day schedule is already approved and cannot be modified")
+
+    # Resolve entities
+    group = db.query(models.Group).filter(models.Group.name == req.group_name).first()
+    if not group:
+        if not req.allow_create_entities:
+            raise ValueError("Group not found")
+        group = models.Group(name=req.group_name)
+        db.add(group)
+        db.commit()
+        db.refresh(group)
+    subject = db.query(models.Subject).filter(models.Subject.name == req.subject_name).first()
+    if not subject:
+        if not req.allow_create_entities:
+            raise ValueError("Subject not found")
+        subject = models.Subject(name=req.subject_name)
+        db.add(subject)
+        db.commit()
+        db.refresh(subject)
+    room = db.query(models.Room).filter(models.Room.name == req.room_name).first()
+    if not room:
+        if not req.allow_create_entities:
+            raise ValueError("Room not found")
+        room = models.Room(name=req.room_name)
+        db.add(room)
+        db.commit()
+        db.refresh(room)
+    teacher_id: int | None = None
+    if req.teacher_name:
+        teacher = db.query(models.Teacher).filter(models.Teacher.name == req.teacher_name).first()
+        if not teacher:
+            if not req.allow_create_entities:
+                raise ValueError("Teacher not found")
+            teacher = models.Teacher(name=req.teacher_name)
+            db.add(teacher)
+            db.commit()
+            db.refresh(teacher)
+        teacher_id = teacher.id
+
+    # Derive end_time if omitted
+    start_time = req.start_time
+    end_time = req.end_time
+    if not end_time:
+        slots = _get_time_slots_for_group(group.name, enable_shifts=True)
+        slot = next((s for s in slots if s["start"] == start_time), None)
+        if not slot:
+            raise ValueError("Unknown start_time for this group's shift; provide end_time explicitly")
+        end_time = slot["end"]
+
+    # Validate: group free at this time
+    is_free_group, _ = _group_is_free(
+        db,
+        group.id,
+        req.date,
+        start_time,
+        end_time,
+        ignore_weekly=bool(req.ignore_weekly_conflicts),
+    )
+    if not is_free_group:
+        raise ValueError("Group already has a pair in this slot (day or weekly plan)")
+    # Validate: room capacity
+    if not _room_has_capacity(db, req.date, start_time, room.id):
+        raise ValueError("Room is not available at this time")
+    # Validate: teacher
+    if teacher_id is not None:
+        if not _teacher_is_free(db, teacher_id, req.date, start_time, end_time, ignore_weekly=bool(req.ignore_weekly_conflicts)):
+            raise ValueError("Teacher is not available at this time")
+
+    e = models.DayScheduleEntry(
+        day_schedule_id=ds.id,
+        group_id=group.id,
+        subject_id=subject.id,
+        teacher_id=teacher_id,
+        room_id=room.id,
+        start_time=start_time,
+        end_time=end_time,  # type: ignore[arg-type]
+        status="pending",
+    )
+    db.add(e)
+    db.commit()
+    db.refresh(e)
+    report = analyze_day_schedule(db, ds.id, group_name=group.name)
+    return {
+        "entry_id": e.id,
+        "day_id": ds.id,
+        "date": ds.date,
+        "group_name": group.name,
+        "status": e.status,
+        "report": report,
+    }
+
+
+def delete_day_entry(db: Session, entry_id: int) -> Dict:
+    e = db.query(models.DayScheduleEntry).filter(models.DayScheduleEntry.id == entry_id).first()
+    if not e:
+        raise ValueError("Entry not found")
+    ds = db.query(models.DaySchedule).get(e.day_schedule_id)
+    if not ds:
+        raise ValueError("Day schedule not found")
+    if ds.status == "approved":
+        raise ValueError("Day schedule already approved; cannot delete entries")
+    group = db.query(models.Group).get(e.group_id)
+    db.delete(e)
+    db.commit()
+    report = analyze_day_schedule(db, ds.id, group_name=(group.name if group else None))
+    return {"deleted": True, "day_id": ds.id, "date": ds.date, "report": report}
+
+
+def autofill_day_min_pairs(db: Session, req: schemas.AutofillDayRequest) -> schemas.DayPlanResponse:
+    # Ensure day exists and not approved
+    ds = db.query(models.DaySchedule).filter(models.DaySchedule.date == req.date).first()
+    if not ds:
+        ds = models.DaySchedule(date=req.date, status="pending")
+        db.add(ds)
+        db.commit()
+        db.refresh(ds)
+    else:
+        if ds.status == "approved":
+            raise ValueError("Day schedule is already approved and cannot be modified")
+
+    # Determine target groups
+    target_group_ids: list[int] = []
+    if req.group_name:
+        g = db.query(models.Group).filter(models.Group.name == req.group_name).first()
+        if not g:
+            raise ValueError("Group not found")
+        target_group_ids = [g.id]
+    else:
+        # all groups appearing in weekly plan for this week
+        week_start = _get_week_start(req.date)
+        dists = db.query(models.WeeklyDistribution).filter(models.WeeklyDistribution.week_start == week_start).all()
+        target_group_ids = sorted({d.schedule_item.group_id for d in dists})
+
+    # Build items with weekly hours for this week
+    from collections import defaultdict as _dd
+    items_by_group: dict[int, list[models.ScheduleItem]] = {}
+    is_even_week = (_get_week_start(req.date).isocalendar().week % 2 == 0)
+    for gid in target_group_ids:
+        items_by_group[gid] = []
+    q = db.query(models.WeeklyDistribution).join(models.ScheduleItem).filter(models.WeeklyDistribution.week_start == _get_week_start(req.date))
+    if target_group_ids:
+        q = q.filter(models.ScheduleItem.group_id.in_(target_group_ids))
+    for d in q.all():
+        it = d.schedule_item
+        # include items that have any hours this week
+        wh = d.hours_even if d.is_even_week else d.hours_odd
+        if wh and wh > 0 and it.group_id in items_by_group:
+            items_by_group[it.group_id].append(it)
+    # fallback: if no dists, use all schedule items for those groups
+    if not any(items_by_group.values()):
+        iq = db.query(models.ScheduleItem)
+        if target_group_ids:
+            iq = iq.filter(models.ScheduleItem.group_id.in_(target_group_ids))
+        for it in iq.all():
+            if it.group_id in items_by_group:
+                items_by_group[it.group_id].append(it)
+
+    # Occupancy snapshots based on existing entries
+    occupied_teacher: set[tuple] = set()
+    occupied_group: set[tuple] = set()
+    room_occupancy: _dd = _dd(int)
+    gym_teachers: _dd = _dd(set)
+    for e in ds.entries:
+        occupied_group.add((req.date, e.start_time, e.group_id))
+        if e.teacher_id:
+            occupied_teacher.add((req.date, e.start_time, e.teacher_id))
+        room_occupancy[(req.date, e.start_time, e.room_id)] += 1
+        if e.room_id:
+            room = db.query(models.Room).get(e.room_id)
+            if room and "Спортзал" in room.name and e.teacher_id:
+                gym_teachers[(req.date, e.start_time, e.room_id)].add(e.teacher_id)
+
+    added_total = 0
+    for gid in target_group_ids:
+        # Count current for this group
+        cur_count = sum(1 for e in ds.entries if e.group_id == gid)
+        if cur_count >= req.ensure_pairs_per_day:
+            continue
+        group = db.query(models.Group).get(gid)
+        if not group:
+            continue
+        # Subject repeat cap
+        subj_repeat: dict[int, int] = {}
+        for e in ds.entries:
+            if e.group_id == gid:
+                subj_repeat[e.subject_id] = subj_repeat.get(e.subject_id, 0) + 1
+        # Slots ordered by time
+        slots = (_get_time_slots_for_group(group.name, enable_shifts=True) if not req.use_both_shifts else (
+            _get_time_slots_for_group(group.name, enable_shifts=True) + _get_time_slots_for_group(group.name, enable_shifts=False)
+        ))
+        # De-duplicate while keeping order if both shifts combined
+        seen_starts = set()
+        ordered_slots = []
+        for s in slots:
+            if s["start"] not in seen_starts:
+                ordered_slots.append(s)
+                seen_starts.add(s["start"])
+        for slot in ordered_slots:
+            if cur_count >= req.ensure_pairs_per_day:
+                break
+            st, en = slot["start"], slot["end"]
+            # Skip if group occupied
+            if (req.date, st, gid) in occupied_group:
+                continue
+            # pick first feasible item
+            picked: models.ScheduleItem | None = None
+            reasons_for_slot: list[str] = []
+            for it in items_by_group.get(gid, []):
+                # Subject repeats
+                if not req.allow_repeated_subjects and subj_repeat.get(it.subject_id, 0) > 0:
+                    reasons_for_slot.append("repeat_subject")
+                    continue
+                if req.allow_repeated_subjects and subj_repeat.get(it.subject_id, 0) >= (req.max_repeats_per_subject or 2):
+                    reasons_for_slot.append("repeat_cap")
+                    continue
+                # Teacher availability
+                if it.teacher_id and (not _teacher_is_free(db, it.teacher_id, req.date, st, en, ignore_weekly=bool(req.ignore_weekly_conflicts))):
+                    reasons_for_slot.append("teacher_busy")
+                    continue
+                # Room capacity
+                capacity_ok = _room_has_capacity(db, req.date, st, it.room_id)
+                if not capacity_ok:
+                    reasons_for_slot.append("room_busy")
+                    continue
+                # Gym unique teacher per slot
+                room = db.query(models.Room).get(it.room_id)
+                if room and "Спортзал" in room.name and it.teacher_id in gym_teachers[(req.date, st, it.room_id)]:
+                    reasons_for_slot.append("gym_teacher_dup")
+                    continue
+                picked = it
+                break
+            if not picked:
+                continue
+            # Add entry
+            e = models.DayScheduleEntry(
+                day_schedule_id=ds.id,
+                group_id=gid,
+                subject_id=picked.subject_id,
+                teacher_id=picked.teacher_id,
+                room_id=picked.room_id,
+                start_time=st,
+                end_time=en,
+                status="pending",
+                schedule_item_id=picked.id,
+            )
+            db.add(e)
+            # update occupancies
+            occupied_group.add((req.date, st, gid))
+            if picked.teacher_id:
+                occupied_teacher.add((req.date, st, picked.teacher_id))
+            room_occupancy[(req.date, st, picked.room_id)] += 1
+            picked_room = db.query(models.Room).get(picked.room_id)
+            if picked_room and "Спортзал" in picked_room.name and picked.teacher_id:
+                gym_teachers[(req.date, st, picked.room_id)].add(picked.teacher_id)
+            cur_count += 1
+            added_total += 1
+        db.commit()
+
+    # Return updated day
+    return get_day_schedule(db, req.date, req.group_name)

@@ -1,4 +1,9 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+try:
+    # pydantic v2
+    from pydantic import AliasChoices
+except Exception:
+    AliasChoices = None  # type: ignore
 from typing import Optional, List, Dict
 from enum import Enum
 from datetime import date
@@ -253,15 +258,58 @@ class DayPlanResponse(BaseModel):
 
 class ReplaceEntryManualRequest(BaseModel):
     entry_id: int
-    teacher_name: str
+    # Accept both teacher_name and teacherName
+    teacher_name: str = Field(
+        ..., validation_alias=(AliasChoices("teacher_name", "teacherName") if AliasChoices else None)
+    )
 
 
 class UpdateEntryManualRequest(BaseModel):
     entry_id: int
-    teacher_name: Optional[str] = None
-    subject_name: Optional[str] = None
-    room_name: Optional[str] = None
+    # Accept both snake_case and camelCase for all fields
+    teacher_name: Optional[str] = Field(
+        default=None,
+        validation_alias=(AliasChoices("teacher_name", "teacherName") if AliasChoices else None),
+    )
+    subject_name: Optional[str] = Field(
+        default=None,
+        validation_alias=(AliasChoices("subject_name", "subjectName") if AliasChoices else None),
+    )
+    room_name: Optional[str] = Field(
+        default=None,
+        validation_alias=(AliasChoices("room_name", "roomName") if AliasChoices else None),
+    )
 
+
+# Manual add/delete + autofill for day plan
+class AddEntryManualRequest(BaseModel):
+    date: date
+    group_name: str
+    start_time: str
+    end_time: Optional[str] = None  # if not set, derived from slot grid by start_time
+    subject_name: str
+    room_name: str
+    teacher_name: Optional[str] = None
+    # Validation/creation flags
+    ignore_weekly_conflicts: Optional[bool] = True
+    allow_create_entities: Optional[bool] = True  # create missing subject/room/teacher if needed
+
+
+class DeleteEntryResponse(BaseModel):
+    deleted: bool
+    day_id: int
+    date: date
+
+
+class AutofillDayRequest(BaseModel):
+    date: date
+    group_name: Optional[str] = None
+    ensure_pairs_per_day: int = 2  # ensure at least this many pairs per group on this date
+    # Tuning
+    allow_repeated_subjects: Optional[bool] = False
+    max_repeats_per_subject: Optional[int] = 2
+    use_both_shifts: Optional[bool] = False
+    ignore_weekly_conflicts: Optional[bool] = True
 
 class DayReportIssue(BaseModel):
     code: str
@@ -417,11 +465,15 @@ class ExportScheduleRequest(BaseModel):
 # --- Day entry room swap ---
 class RoomSwapChoice(BaseModel):
     entry_id: int
-    room_name: str
+    room_name: str = Field(
+        ..., validation_alias=(AliasChoices("room_name", "roomName") if AliasChoices else None)
+    )
 
 
 class SwapRoomRequest(BaseModel):
-    desired_room_name: str
+    desired_room_name: str = Field(
+        ..., validation_alias=(AliasChoices("desired_room_name", "desiredRoomName") if AliasChoices else None)
+    )
     choices: Optional[List[RoomSwapChoice]] = None
     dry_run: Optional[bool] = False
 
@@ -443,6 +495,42 @@ class RoomSwapPlanResponse(BaseModel):
     desired_room_name: str
     is_free: bool
     conflicts: List[RoomSwapConflictItem]
+    can_auto_resolve: bool
+
+
+# --- Teacher swap ---
+class TeacherSwapChoice(BaseModel):
+    entry_id: int
+    teacher_name: str = Field(
+        ..., validation_alias=(AliasChoices("teacher_name", "teacherName") if AliasChoices else None)
+    )
+
+
+class SwapTeacherRequest(BaseModel):
+    desired_teacher_name: str = Field(
+        ..., validation_alias=(AliasChoices("desired_teacher_name", "desiredTeacherName") if AliasChoices else None)
+    )
+    choices: Optional[List[TeacherSwapChoice]] = None
+    dry_run: Optional[bool] = False
+
+
+class TeacherSwapConflictItem(BaseModel):
+    entry_id: int
+    group_name: str
+    subject_name: str
+    teacher_name: Optional[str] = None
+    alternatives: List[str]
+
+
+class TeacherSwapPlanResponse(BaseModel):
+    entry_id: int
+    date: date
+    start_time: str
+    end_time: str
+    desired_teacher_name: str
+    desired_subject_name: Optional[str] = None
+    is_free: bool
+    conflicts: List[TeacherSwapConflictItem]
     can_auto_resolve: bool
 
 

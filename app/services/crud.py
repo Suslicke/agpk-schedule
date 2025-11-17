@@ -1390,6 +1390,35 @@ def _is_placeholder_teacher_name(name: str | None) -> bool:
     return False
 
 
+def _is_placeholder_room_name(name: str | None) -> bool:
+    """Treat room names like 'Без аудитории', 'Empty', 'None', '—' as placeholders.
+    This allows representing an intentionally cleared room without NULLs.
+    """
+    if name is None:
+        return True
+    n = name.strip().casefold()
+    if n in {"без аудитории", "empty", "none", "-", "—", "(пусто)", "пусто"}:
+        return True
+    # Heuristic to catch variations
+    for sub in ("без ауд", "empty", "none", "пуст"):
+        if sub in n:
+            return True
+    return False
+
+
+def get_or_create_empty_room(db: Session) -> models.Room:
+    """Return a dedicated placeholder room used to mark 'no room'."""
+    name = "Без аудитории"
+    r = db.query(models.Room).filter(models.Room.name == name).first()
+    if r:
+        return r
+    r = models.Room(name=name)
+    db.add(r)
+    db.commit()
+    db.refresh(r)
+    return r
+
+
 def replace_vacant_auto(db: Session, day_schedule_id: int) -> Dict:
     ds = db.query(models.DaySchedule).filter(models.DaySchedule.id == day_schedule_id).first()
     if not ds:
@@ -2367,9 +2396,13 @@ def query_schedule(
             if teacher_name and ((not t) or t.name != teacher_name):
                 continue
             s = db.query(models.Subject).get(e.subject_id)
-            r = db.query(models.Room).get(e.room_id)
+            r = db.query(models.Room).get(e.room_id) if e.room_id else None
             day_str = days[ds.date.weekday()] if 0 <= ds.date.weekday() < len(days) else str(ds.date.weekday())
             overrides_index.add((ds.date, e.group_id, e.start_time))
+            # Convert placeholder room to empty string for UI
+            room_name_out = ""
+            if r and not _is_placeholder_room_name(r.name):
+                room_name_out = r.name
             items.append(
                 schemas.ScheduleQueryEntry(
                     date=ds.date,
@@ -2378,7 +2411,7 @@ def query_schedule(
                     end_time=e.end_time,
                     subject_name=s.name if s else str(e.subject_id),
                     teacher_name=(t.name if t else ""),
-                    room_name=r.name if r else str(e.room_id),
+                    room_name=room_name_out,
                     group_name=g.name if g else str(e.group_id),
                     origin="day_plan",
                     approval_status=e.status,

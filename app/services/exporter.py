@@ -136,7 +136,8 @@ def _collect_weekly_slots_in_range(
                     "weekly_pairs": pairs,
                 }
             )
-    items.sort(key=lambda x: (x["date"], x["start_time"], x["group_name"]))
+    # Sort primarily by group for clearer grouped view
+    items.sort(key=lambda x: (x["group_name"], x["date"], x["start_time"]))
     return items
 
 
@@ -265,6 +266,11 @@ def build_day_with_diff_excel(db: Session, date_: date, group_name: Optional[str
     # Build dataframes
     df_actual = pd.DataFrame(list(actual.values()))
     df_plan = pd.DataFrame(list(plan.values()))
+    # Ensure consistent group-first sorting for readability
+    if not df_actual.empty:
+        df_actual.sort_values(by=["group_name", "start_time"], inplace=True)
+    if not df_plan.empty:
+        df_plan.sort_values(by=["group_name", "start_time"], inplace=True)
     # Diff
     keys = set(actual.keys()) | set(plan.keys())
     diff_rows: List[Dict] = []
@@ -400,7 +406,7 @@ def _collect_actual_slots_in_range(
                     "status": e.status,
                 }
             )
-    rows.sort(key=lambda x: (x["date"], x["start_time"], x["group_name"]))
+    rows.sort(key=lambda x: (x["group_name"], x["date"], x["start_time"]))
     return rows
 
 
@@ -445,7 +451,7 @@ def _compute_diff_for_range(plan_rows: List[Dict], actual_rows: List[Dict]) -> L
                 "actual_status": a.get("status") if a else None,
             }
         )
-    diffs.sort(key=lambda x: (x["date"], x["start_time"], x["group_name"]))
+    diffs.sort(key=lambda x: (x["group_name"], x["date"], x["start_time"]))
     return diffs
 
 
@@ -471,6 +477,8 @@ def build_schedule_range_excel(
                 df_plan = _to_df(plan_rows, [
                     "date","day","start_time","end_time","group_name","subject_name","teacher_name","room_name","week_start","week_end","is_even_week","weekly_hours","weekly_pairs"
                 ])
+                if not df_plan.empty:
+                    df_plan.sort_values(by=["group_name", "date", "start_time"], inplace=True)
                 df_plan.to_excel(writer, index=False, sheet_name="Plan")
                 ws = writer.sheets.get("Plan")
                 if ws is not None:
@@ -480,6 +488,8 @@ def build_schedule_range_excel(
                 df_actual = _to_df(actual_rows, [
                     "date","day","start_time","end_time","group_name","subject_name","teacher_name","room_name","status"
                 ])
+                if not df_actual.empty:
+                    df_actual.sort_values(by=["group_name", "date", "start_time"], inplace=True)
                 df_actual.to_excel(writer, index=False, sheet_name="Actual")
                 ws = writer.sheets.get("Actual")
                 if ws is not None:

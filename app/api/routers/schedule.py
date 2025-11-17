@@ -203,6 +203,34 @@ def room_swap_plan(entry_id: int, desired_room_name: str, limit_alternatives: in
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.get(
+    "/day/entry/{entry_id}/teacher_swap_plan",
+    summary="Propose a teacher swap plan to free a busy teacher for entry",
+    tags=["day_plan"],
+)
+def teacher_swap_plan(entry_id: int, desired_teacher_name: str, limit_alternatives: int = 5, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    try:
+        plan = day_svc.propose_teacher_swap(db, entry_id, desired_teacher_name, limit_alternatives=limit_alternatives)
+        return plan
+    except ValueError as e:
+        logger.warning("Teacher swap plan failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post(
+    "/day/entry/{entry_id}/swap_teacher",
+    summary="Execute teacher swap (reassign conflicting entries then set desired teacher)",
+    tags=["day_plan"],
+)
+def swap_teacher(entry_id: int, req: schemas.SwapTeacherRequest, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    try:
+        result = day_svc.execute_teacher_swap(db, entry_id, req.desired_teacher_name, choices=req.choices or [], dry_run=bool(req.dry_run))
+        return result
+    except ValueError as e:
+        logger.warning("Swap teacher failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.post(
     "/day/entry/{entry_id}/swap_room",
     summary="Execute room swap (reassign conflicting entries then set desired room)",
@@ -214,6 +242,20 @@ def swap_room(entry_id: int, req: schemas.SwapRoomRequest, db: Session = Depends
         return result
     except ValueError as e:
         logger.warning("Swap room failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post(
+    "/day/entry/{entry_id}/clear_room",
+    summary="Clear room for an entry (mark as empty placeholder)",
+    tags=["day_plan"],
+)
+def clear_room(entry_id: int, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    try:
+        result = day_svc.clear_entry_room(db, entry_id)
+        return result
+    except ValueError as e:
+        logger.warning("Clear room failed: %s", e)
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -343,6 +385,61 @@ def update_entry_manual(req: schemas.UpdateEntryManualRequest, db: Session = Dep
         logger.warning("Update entry manual failed: %s", e)
         raise HTTPException(status_code=400, detail=str(e))
 
+
+@router.post(
+    "/day/add_entry_manual",
+    response_model=Dict,
+    summary="Manually add a new day entry (create if day missing)",
+    tags=["day_plan"],
+)
+def add_entry_manual(req: schemas.AddEntryManualRequest, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    try:
+        logger.info(
+            "Add entry manual date=%s group=%s %s-%s subj=%s room=%s teacher=%s",
+            req.date,
+            req.group_name,
+            req.start_time,
+            req.end_time or "",
+            req.subject_name,
+            req.room_name,
+            req.teacher_name or "",
+        )
+        result = day_svc.add_day_entry_manual(db, req)
+        return result
+    except ValueError as e:
+        logger.warning("Add entry manual failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete(
+    "/day/entry/{entry_id}",
+    response_model=schemas.DeleteEntryResponse,
+    summary="Delete day entry by id",
+    tags=["day_plan"],
+)
+def delete_entry(entry_id: int, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    try:
+        logger.info("Delete day entry id=%s", entry_id)
+        res = day_svc.delete_day_entry(db, entry_id)
+        return schemas.DeleteEntryResponse(deleted=bool(res.get("deleted")), day_id=res.get("day_id"), date=res.get("date"))
+    except ValueError as e:
+        logger.warning("Delete day entry failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post(
+    "/day/autofill_min_pairs",
+    response_model=schemas.DayPlanResponse,
+    summary="Autofill day to ensure minimal pairs per group (incremental, no deletions)",
+    tags=["day_plan"],
+)
+def autofill_min_pairs(req: schemas.AutofillDayRequest, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    try:
+        logger.info("Autofill day date=%s group=%s ensure=%s", req.date, req.group_name, req.ensure_pairs_per_day)
+        return day_svc.autofill_day_min_pairs(db, req)
+    except ValueError as e:
+        logger.warning("Autofill day failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
 
 @router.get(
     "/day/entry_lookup",
