@@ -134,3 +134,14 @@ class DayScheduleEntry(Base):
     schedule_item_id = Column(Integer, ForeignKey("schedule_items.id"), nullable=True, index=True)
 
     day_schedule = relationship("DaySchedule", back_populates="entries")
+
+
+# Practice periods for groups
+class Practice(Base):
+    __tablename__ = "practices"
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=False, index=True)
+    start_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=False)
+    name = Column(String, nullable=True)  # optional description
+    group = relationship("Group")

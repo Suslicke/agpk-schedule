@@ -1636,6 +1636,12 @@ def autofill_day_min_pairs(db: Session, req: schemas.AutofillDayRequest) -> sche
 
     added_total = 0
     for gid in target_group_ids:
+        # Check if group is on practice - skip if so
+        if crud.is_group_on_practice(db, gid, req.date):
+            group = db.query(models.Group).get(gid)
+            group_name = group.name if group else str(gid)
+            logger.info("Group %s (id=%s) is on practice on %s, skipping autofill", group_name, gid, req.date)
+            continue
         # Count current for this group
         cur_count = sum(1 for e in ds.entries if e.group_id == gid)
         if cur_count >= req.ensure_pairs_per_day:

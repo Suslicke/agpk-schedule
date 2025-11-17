@@ -129,17 +129,6 @@ def generate_semester_status(job_id: str):
 
 
 
-
-# Moved to the bottom to avoid path shadowing for /schedule/day
-
-
-"""
-Removed redundant week endpoints. Use /schedule/query with a 1-week range:
-  - /schedule/query?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD&group_name=... 
-  - /schedule/query?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD&teacher_name=...
-"""
-
-
 # --- Day plan (1 day ahead) ---
 @router.post(
     "/day/plan",

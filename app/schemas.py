@@ -627,3 +627,26 @@ class DistributionResponse(BaseModel):
 
 class ScheduleTimeseriesResponse(BaseModel):
     points: List[ScheduleTimeseriesPoint]
+
+
+# Practice periods schemas
+class PracticeCreate(BaseModel):
+    group_name: str
+    start_date: date
+    end_date: date
+    name: Optional[str] = None
+
+
+class PracticeResponse(BaseModel):
+    id: int
+    group_name: str
+    start_date: date
+    end_date: date
+    name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class PracticeListResponse(BaseModel):
+    items: List[PracticeResponse]

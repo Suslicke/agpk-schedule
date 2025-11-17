@@ -36,8 +36,12 @@ Core endpoints
 
 - Day plan
   - `POST /admin/schedule/generate_semester` — generate schedules for a semester (async by default). Requires `X-Admin-Token`.
+    - **Новое поведение**: При создании недельного плана система гарантирует **минимум 3 пары для каждой группы в день**, начиная **с первого урока** соответствующей смены.
+    - **Практика**: Группы на практике автоматически исключаются из создания расписания.
   - `POST /schedule/day/plan` — (protected) create plan for a date; by default for ALL groups (omit `group_name`). Requires `X-Admin-Token`.
     - Optional: `auto_vacant_remove: true` — automatically replace vacant/unknown teachers with available ones using group-teacher-subject mappings.
+    - **Новое поведение**: При создании расписания с нуля (from_plan=false) система гарантирует **минимум 3 пары для каждой группы**, начиная **с первого урока** смены.
+    - **Практика**: Группы на практике автоматически исключаются из создания расписания.
   - `GET /schedule/day?date=YYYY-MM-DD` — get day plan.
   - `POST /schedule/day/{day_id}/approve` — (protected) approve day plan. Query params:
     - `group_name` — approve only this group within the day
@@ -102,6 +106,35 @@ Logging
 - Every API call emits entries like: `[request_id] METHOD /path -> status in ms`.
 - Schedule generation logs why slots are skipped (room busy, teacher/group busy, gym capacity, daily max) and what was assigned per week.
 
+Monitoring & Analytics
+
+- `GET /metrics` — Prometheus-compatible metrics endpoint для мониторинга:
+  - `schedule_api_requests_total` — общее количество запросов (по методам, endpoints, статусам)
+  - `schedule_api_request_duration_seconds` — длительность обработки запросов
+  - `schedule_api_active_requests` — количество активных запросов
+  - `schedule_generation_total` — счетчик генераций расписаний (успех/ошибка)
+  - `schedule_generation_duration_seconds` — время генерации расписаний
+- `GET /stats` — JSON статистика для дашбордов:
+  - Детальная информация по каждому endpoint (количество, средняя/мин/макс длительность, ошибки)
+  - Список медленных запросов (>1s)
+  - Общая статистика (всего запросов, ошибок, средняя скорость)
+- Автоматическое логирование медленных запросов (warning в логах)
+- Совместимость с Grafana и другими системами мониторинга
+
+CI/CD
+
+- **GitHub Actions Pipeline** для автоматизации:
+  - ✅ Линтинг (Ruff) и форматирование (Black, isort)
+  - ✅ Проверка безопасности (Bandit, Safety)
+  - ✅ Автоматические тесты с coverage
+  - ✅ Сборка Docker образа
+  - ✅ Автоматический деплой на сервер
+- **Конфигурация:**
+  - `.github/workflows/ci-cd.yml` — основной pipeline
+  - `pyproject.toml` — настройки линтеров и тестов
+  - См. `DEPLOYMENT.md` для подробной инструкции
+  - См. `.github/SECRETS.md` для настройки GitHub Secrets
+
 Security
 - All mutating endpoints are protected and also mirrored under `/admin`.
 - Set `ADMIN_API_KEY` and pass it in header `X-Admin-Token`.
@@ -149,3 +182,13 @@ Export
   - `POST /analytics/heatmap?dimension=teacher|group|room&name=...` — тепловая карта по дням/слотам.
   - `POST /analytics/distribution?dimension=teacher|group|subject|room` — распределения для bar‑чартов.
   - `POST /analytics/timeseries` — дневной ряд planned vs actual (для линий/столбцов): `{ start_date, end_date, groups?, teachers?, subjects?, rooms? }`.
+
+- Practice (Практика)
+  - `POST /practice` — создать период практики для группы (защищено). Requires `X-Admin-Token`.
+    - Тело: `{ "group_name": "Т25-1", "start_date": "2025-12-01", "end_date": "2025-12-15", "name": "Производственная практика" }`
+    - Во время практики группа не будет включена в расписание занятий.
+  - `GET /practice` — получить список периодов практики.
+    - Query параметры:
+      - `group_name` — фильтр по имени группы
+      - `active_on` — фильтр по дате (YYYY-MM-DD), вернет только активные практики на эту дату
+  - `DELETE /practice/{practice_id}` — удалить период практики (защищено). Requires `X-Admin-Token`.

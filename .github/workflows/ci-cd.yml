@@ -1,0 +1,113 @@
+name: Simple Deploy
+
+# Когда запускается: при push в ветку main
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  # Единственная задача: загрузить код на сервер и запустить
+  deploy:
+    name: 🚀 Deploy to Server
+    runs-on: ubuntu-latest
+
+    steps:
+      # ШАГ 1: Получаем код из репозитория
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      # ШАГ 2: Настраиваем SSH для подключения к серверу
+      - name: 🔐 Setup SSH
+        run: |
+          # Создаем папку для SSH ключей
+          mkdir -p ~/.ssh
+
+          # Сохраняем приватный ключ из секретов GitHub
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+
+          # Устанавливаем правильные права (обязательно!)
+          chmod 600 ~/.ssh/deploy_key
+
+          # Добавляем сервер в известные хосты (чтобы не было вопросов при подключении)
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+
+      # ШАГ 3: Копируем файлы на сервер
+      - name: 📤 Copy files to server
+        run: |
+          # Используем rsync для копирования всех файлов проекта
+          # Исключаем ненужное (.git, .github, __pycache__, и т.д.)
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='.env' \
+            --exclude='venv' \
+            --exclude='.venv' \
+            --exclude='logs/' \
+            ./ ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:${{ secrets.DEPLOY_PATH }}/
+
+      # ШАГ 4: Запускаем на сервере
+      - name: 🐳 Run docker-compose
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'ENDSSH'
+
+          # Переходим в папку проекта
+          cd ${{ secrets.DEPLOY_PATH }}
+
+          # Останавливаем старые контейнеры (если есть)
+          docker-compose down || true
+
+          # Применяем миграции базы данных
+          docker-compose run --rm web alembic upgrade head
+
+          # Запускаем все сервисы в фоне
+          docker-compose up -d --build
+
+          # Даем время на запуск (5 секунд)
+          echo "⏳ Waiting for services to start..."
+          sleep 5
+
+          # Показываем статус контейнеров
+          echo "📊 Container status:"
+          docker-compose ps
+
+          ENDSSH
+
+      # ШАГ 5: Проверяем что всё работает
+      - name: ✅ Health check
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'ENDSSH'
+
+          cd ${{ secrets.DEPLOY_PATH }}
+
+          # Проверяем health endpoint
+          echo "🏥 Checking health..."
+          if curl -f http://localhost:8000/health; then
+            echo "✅ Application is healthy!"
+          else
+            echo "❌ Health check failed!"
+            echo "📋 Container logs:"
+            docker-compose logs --tail=50 web
+            exit 1
+          fi
+
+          ENDSSH
+
+      # ШАГ 6: Очистка (удаляем SSH ключ)
+      - name: 🧹 Cleanup
+        if: always()
+        run: |
+          rm -f ~/.ssh/deploy_key
+
+      # ШАГ 7: Финальное сообщение
+      - name: 🎉 Success
+        if: success()
+        run: |
+          echo "================================"
+          echo "✅ Deployment successful!"
+          echo "🌐 Application URL: ${{ secrets.SERVER_URL }}"
+          echo "================================"

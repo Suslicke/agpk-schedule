@@ -1,4 +1,4 @@
-from typing import List, Set, Dict
+from typing import List, Set, Dict, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 from app import models
@@ -290,6 +290,8 @@ def _assign_daily_schedule(
     base_days = len(available_days)
     if concentrate_on_preferred_days and preferred_days:
         base_days = min(len(preferred_days), base_days)
+    # ALWAYS MINIMUM 3 PAIRS PER DAY
+    min_pairs_per_day = max(3, min_pairs_per_day)
     pairs_per_day = min(max_pairs_per_day, max(min_pairs_per_day, math.ceil(pairs_needed / max(1, base_days))))
     group_day_counts = defaultdict(int)
     slots = _get_time_slots_for_group(schedule_item.group.name, enable_shifts)
@@ -307,8 +309,8 @@ def _assign_daily_schedule(
         if remaining_ah <= 0:
             break
         pairs_assigned = 0
+        # DO NOT SHUFFLE - always start from first lesson
         local_slots = slots.copy()
-        random.shuffle(local_slots)
         for slot in local_slots:
             if pairs_assigned >= pairs_per_day or remaining_ah <= 0:
                 break
@@ -470,6 +472,21 @@ def fill_schedules(db: Session, gen_schedules: List[models.GeneratedSchedule], r
         for item in all_items:
             if remaining_hours[item.id] <= 0:
                 continue
+            # Check if group is on practice during this week - skip if so
+            # We need to check each day in the week for practice
+            week_has_practice = False
+            check_date = current_date
+            while check_date <= week_end:
+                if is_group_on_practice(db, item.group_id, check_date):
+                    week_has_practice = True
+                    logger.info("Group %s (id=%s) is on practice during week %s-%s, skipping",
+                               item.group.name, item.group_id, current_date, week_end)
+                    break
+                check_date += timedelta(days=1)
+
+            if week_has_practice:
+                continue
+
             # Pair size may be overridden per request
             pair_size_ah = request.pair_size_academic_hours or PAIR_SIZE_AH
             weekly_ah = min(item.weekly_hours, remaining_hours[item.id])
@@ -963,6 +980,10 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
         g = db.query(models.Group).filter(models.Group.name == request.group_name).first()
         if not g:
             raise ValueError("Group not found")
+        # Check if group is on practice
+        if is_group_on_practice(db, g.id, request.date):
+            logger.info("Group %s is on practice on %s, skipping schedule creation", g.name, request.date)
+            raise ValueError(f"Group {g.name} is on practice on {request.date}")
         target_groups = {g.id}
 
     # Rebuild behavior: if group filter is provided, wipe all existing entries for this group; otherwise wipe all entries for the date
@@ -1011,6 +1032,13 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
         for dist in week_distributions:
             item = dist.schedule_item
             if target_groups and item.group_id not in target_groups:
+                continue
+            # Check if group is on practice - skip if so
+            if is_group_on_practice(db, item.group_id, request.date):
+                group = db.query(models.Group).get(item.group_id)
+                group_name = group.name if group else str(item.group_id)
+                logger.info("Group %s (id=%s) is on practice on %s, skipping from plan", group_name, item.group_id, request.date)
+                debug_notes.append(f"Группа {group_name} на практике, пары из недельного плана не добавляются")
                 continue
             for slot in dist.daily_schedule or []:
                 if slot.get("day") != dow:
@@ -1165,6 +1193,11 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
             group = db.query(models.Group).get(gid)
             if not group:
                 continue
+            # Check if group is on practice - skip if so
+            if is_group_on_practice(db, gid, request.date):
+                logger.info("Group %s (id=%s) is on practice on %s, skipping", group.name, gid, request.date)
+                debug_notes.append(f"Группа {group.name} на практике, расписание не создается")
+                continue
             # Subject repeat control per day
             subj_repeat: defaultdict = defaultdict(int)
             # Slots ordered by time для смены группы, или обе смены при запросе
@@ -1175,10 +1208,13 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
             # Поддержка отладочного сообщения ниже (переменная на кириллице, чтобы избежать NameError в f-строке)
             слотов = slots
             # We'll try to fill slots in order
+            # MINIMUM 3 PAIRS PER GROUP (starting from first lesson)
+            min_pairs = 3
+            target_pairs = max(min_pairs, per_group_daily_cap)
             total_added = 0
             started = False
             for slot in slots:
-                if total_added >= per_group_daily_cap:
+                if total_added >= target_pairs:
                     break
                 start = slot["start"]
                 end = slot["end"]
@@ -1271,9 +1307,14 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
                 subj_repeat[picked_item.subject_id] += 1
                 started = True
             # If we filled fewer than cap and ran out of slots, note that
-            if total_added < per_group_daily_cap and len(slots) < per_group_daily_cap:
+            if total_added < target_pairs and len(slots) < target_pairs:
                 debug_notes.append(
-                    f"Группа {group.name}: всего {len(slотов) if 'слотов' in locals() else len(slots)} слотов в смене; требуется {per_group_daily_cap}. Включите use_both_shifts или расширьте сетку слотов."
+                    f"Группа {group.name}: всего {len(слотов)} слотов в смене; требуется минимум {min_pairs}. Включите use_both_shifts или расширьте сетку слотов."
+                )
+            # Warn if minimum not met
+            elif total_added < min_pairs:
+                debug_notes.append(
+                    f"Группа {group.name}: удалось создать только {total_added} пар(ы), минимум - {min_pairs}"
                 )
         db.commit()
     # Save debug notes for this day
@@ -3128,3 +3169,83 @@ def analytics_schedule_timeseries(db: Session, req: schemas.AnalyticsFilter) -> 
             )
         )
     return points
+
+
+# ---- Practice periods CRUD ----
+def create_practice(db: Session, practice: schemas.PracticeCreate) -> models.Practice:
+    """Create a practice period for a group."""
+    logger.info("Creating practice for group=%s from %s to %s", practice.group_name, practice.start_date, practice.end_date)
+
+    # Validate dates
+    if practice.end_date < practice.start_date:
+        raise ValueError("end_date must be >= start_date")
+
+    # Find group
+    group = db.query(models.Group).filter(models.Group.name == practice.group_name).first()
+    if not group:
+        raise ValueError(f"Group not found: {practice.group_name}")
+
+    # Check for overlapping practices
+    overlapping = db.query(models.Practice).filter(
+        models.Practice.group_id == group.id,
+        models.Practice.start_date <= practice.end_date,
+        models.Practice.end_date >= practice.start_date
+    ).first()
+
+    if overlapping:
+        raise ValueError(f"Practice period overlaps with existing practice from {overlapping.start_date} to {overlapping.end_date}")
+
+    # Create practice
+    db_practice = models.Practice(
+        group_id=group.id,
+        start_date=practice.start_date,
+        end_date=practice.end_date,
+        name=practice.name
+    )
+    db.add(db_practice)
+    db.commit()
+    db.refresh(db_practice)
+    logger.info("Created practice id=%s for group=%s", db_practice.id, practice.group_name)
+    return db_practice
+
+
+def get_practices(db: Session, group_name: Optional[str] = None, active_on: Optional[date] = None) -> List[models.Practice]:
+    """Get practice periods, optionally filtered by group or active date."""
+    query = db.query(models.Practice)
+
+    if group_name:
+        group = db.query(models.Group).filter(models.Group.name == group_name).first()
+        if group:
+            query = query.filter(models.Practice.group_id == group.id)
+        else:
+            return []
+
+    if active_on:
+        query = query.filter(
+            models.Practice.start_date <= active_on,
+            models.Practice.end_date >= active_on
+        )
+
+    return query.all()
+
+
+def delete_practice(db: Session, practice_id: int) -> bool:
+    """Delete a practice period."""
+    practice = db.query(models.Practice).filter(models.Practice.id == practice_id).first()
+    if not practice:
+        raise ValueError("Practice not found")
+
+    logger.info("Deleting practice id=%s", practice_id)
+    db.delete(practice)
+    db.commit()
+    return True
+
+
+def is_group_on_practice(db: Session, group_id: int, date_: date) -> bool:
+    """Check if a group is on practice on a specific date."""
+    practice = db.query(models.Practice).filter(
+        models.Practice.group_id == group_id,
+        models.Practice.start_date <= date_,
+        models.Practice.end_date >= date_
+    ).first()
+    return practice is not None

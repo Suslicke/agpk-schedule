@@ -1,9 +1,10 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.database import init_db
-from app.api.routers import schedule, upload, progress, dictionary, admin, export, analytics
+from app.api.routers import schedule, upload, progress, dictionary, admin, export, analytics, practice
 from app.core.config import settings
 from app.core.logging_config import setup_logging, RequestIdMiddleware
+from app.core.monitoring import MetricsMiddleware, get_metrics, get_dashboard_stats, CONTENT_TYPE_LATEST
 
 setup_logging(
     level=settings.log_level,
@@ -36,6 +37,7 @@ app.add_middleware(
 )
 
 app.add_middleware(RequestIdMiddleware)
+app.add_middleware(MetricsMiddleware)
 
 init_db()
 
@@ -46,6 +48,7 @@ app.include_router(dictionary.router)
 app.include_router(admin.router)
 app.include_router(export.router)
 app.include_router(analytics.router)
+app.include_router(practice.router)
 
 
 @app.get("/")
@@ -53,6 +56,18 @@ async def root():
     return {"message": "Welcome to the Schedule Management API"}
 
 
-@app.get("/healths")
-async def healths():
+@app.get("/health")
+async def health():
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint."""
+    return Response(content=get_metrics(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/stats")
+async def stats():
+    """Dashboard-friendly statistics endpoint."""
+    return get_dashboard_stats()
