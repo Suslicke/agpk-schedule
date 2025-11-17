@@ -11,6 +11,7 @@ from app.core.database import SessionLocal, get_db
 from app.core.security import require_admin
 from app.services import crud
 from app.services import day_planning_service as day_svc
+from app.services import replacement_service as replace_svc
 from app.services import schedule_service as sched_svc
 
 router = APIRouter(prefix="/schedule", tags=["schedule"])
@@ -126,10 +127,18 @@ def generate_semester_endpoint(request: schemas.GenerateScheduleRequest, backgro
 )
 def generate_semester_status(job_id: str, db: Session = Depends(get_db)):
     # Query all schedules for this job
-    schedules = db.query(models.GeneratedSchedule).filter(models.GeneratedSchedule.job_id == job_id).all()
+    try:
+        schedules = db.query(models.GeneratedSchedule).filter(models.GeneratedSchedule.job_id == job_id).all()
+    except Exception as e:
+        logger.warning("Error querying by job_id (maybe DB not migrated?): %s", e)
+        # Fallback: return recent schedules if job_id column doesn't exist yet
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database error - please run migrations: alembic upgrade head. Error: {str(e)}"
+        )
 
     if not schedules:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found. Either job doesn't exist or database needs migration.")
 
     # Aggregate status
     statuses = [s.status for s in schedules]
@@ -529,6 +538,52 @@ def bulk_update_strict(day_id: int, req: schemas.BulkUpdateStrictRequest, db: Se
         )
     except ValueError as e:
         logger.warning("Bulk strict update failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# --- Replacement endpoints ---
+@router.post(
+    "/replace/teacher",
+    summary="Replace teacher in schedule (slot or entire item)",
+    tags=["replacements"],
+)
+def replace_teacher_endpoint(request: schemas.ReplaceTeacherRequest, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    try:
+        result = replace_svc.replace_teacher(db, request)
+        logger.info("Teacher replaced: %s -> %s, scope=%s", request.old_teacher_name, request.new_teacher_name, result["scope"])
+        return result
+    except ValueError as e:
+        logger.warning("Replace teacher failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post(
+    "/replace/subject",
+    summary="Replace subject in specific schedule slot",
+    tags=["replacements"],
+)
+def replace_subject_endpoint(request: schemas.ReplaceSubjectRequest, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    try:
+        result = replace_svc.replace_subject(db, request)
+        logger.info("Subject replaced: %s -> %s on %s", request.old_subject_name, request.new_subject_name, request.date)
+        return result
+    except ValueError as e:
+        logger.warning("Replace subject failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post(
+    "/replace/room",
+    summary="Replace room in schedule (slot or entire item)",
+    tags=["replacements"],
+)
+def replace_room_endpoint(request: schemas.ReplaceRoomRequest, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    try:
+        result = replace_svc.replace_room(db, request)
+        logger.info("Room replaced: %s -> %s, scope=%s", request.old_room_name, request.new_room_name, result["scope"])
+        return result
+    except ValueError as e:
+        logger.warning("Replace room failed: %s", e)
         raise HTTPException(status_code=400, detail=str(e))
 
 

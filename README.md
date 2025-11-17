@@ -35,7 +35,7 @@ Core endpoints
       - `day_id`, `entry_id` (если из дневного плана)
     - Примечание: для дат, на которые есть дневной план, в выдаче приоритет у утверждённых и вручную заменённых пар из дневного плана; слоты недельного плана на эти же (date, group, time) скрываются.
 
-- Day plan
+- Schedule Generation
   - `POST /admin/schedule/generate_semester` — generate schedules for a semester (async by default). Requires `X-Admin-Token`.
     - **Асинхронная генерация**: Возвращает `job_id` для отслеживания прогресса через `/schedule/generate_semester/status/{job_id}`
     - **Статистика**: После завершения доступна детальная статистика:
@@ -44,11 +44,44 @@ Core endpoints
       - Предупреждения (warnings) - где не удалось назначить все часы
       - Превышения часов (hours_exceeded) - где создано больше пар чем планировалось
     - **Генерация всегда продолжается**: Даже при превышении часов план создаётся полностью, информация о превышениях сохраняется в статистике
-    - **Минимум 3 пары в день**: Система гарантирует **минимум 3 пары для каждой группы в день**, начиная **с первого урока** соответствующей смены
+    - **⭐ НОВОЕ: Гарантия минимум 3 пар в день**:
+      - Система работает **по группам** (а не по предметам)
+      - Для каждой группы на каждый день гарантируется **МИНИМУМ 3 пары**
+      - Пары начинаются **с первого урока** соответствующей смены
+      - Если есть свободные преподаватели и кабинеты, добавляется 4-я пара
     - **Практика**: Группы на практике автоматически исключаются из создания расписания
+
+- Replacements (Замены)
+  - `POST /admin/schedule/replace/teacher` — заменить преподавателя. Requires `X-Admin-Token`.
+    ```json
+    {
+      "group_name": "Т25-1",
+      "subject_name": "Математика",
+      "old_teacher_name": "Иванов И.И.",
+      "new_teacher_name": "Петров П.П.",
+      "date": "2025-12-23",        // опционально - для замены в конкретном слоте
+      "start_time": "08:00"        // опционально
+    }
+    ```
+    - Если указаны `date` и `start_time` - замена в конкретном слоте (DayScheduleEntry)
+    - Если не указаны - замена во всем ScheduleItem (влияет на будущие генерации)
+  - `POST /admin/schedule/replace/subject` — заменить предмет в конкретном слоте. Requires `X-Admin-Token`.
+  - `POST /admin/schedule/replace/room` — заменить кабинет. Requires `X-Admin-Token`.
+    - Если указаны `date` и `start_time` - замена в конкретном слоте
+    - Если не указаны - замена во всем ScheduleItem
+
+- Multiple Teachers Support (Множественные преподаватели)
+  - **Excel парсер** автоматически разделяет "Иванов И.И./Петров П.П." на отдельных преподавателей
+  - Каждый ScheduleItem может иметь несколько преподавателей
+  - Поле `teacher_slots` показывает количество преподавателей
+  - Связь many-to-many через таблицу `schedule_item_teachers`
+  - При замене преподавателя можно заменить конкретного из списка
+
+- Day plan
   - `POST /schedule/day/plan` — (protected) create plan for a date; by default for ALL groups (omit `group_name`). Requires `X-Admin-Token`.
+    - **⭐ NEW**: `clear_existing: false` (default) - сохраняет существующие записи, добавляет только новые
+    - `clear_existing: true` - удаляет существующие записи перед созданием новых
     - Optional: `auto_vacant_remove: true` — automatically replace vacant/unknown teachers with available ones using group-teacher-subject mappings.
-    - **Новое поведение**: При создании расписания с нуля (from_plan=false) система гарантирует **минимум 3 пары для каждой группы**, начиная **с первого урока** смены.
     - **Практика**: Группы на практике автоматически исключаются из создания расписания.
   - `GET /schedule/day?date=YYYY-MM-DD` — get day plan.
   - `POST /schedule/day/{day_id}/approve` — (protected) approve day plan. Query params:

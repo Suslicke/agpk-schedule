@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import JSON, Column, Date, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import JSON, Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -41,20 +41,36 @@ class Room(Base):
     schedule_items = relationship("ScheduleItem", back_populates="room", cascade="all, delete-orphan")
 
 
+class ScheduleItemTeacher(Base):
+    """Association table for many-to-many relationship between ScheduleItem and Teacher"""
+    __tablename__ = "schedule_item_teachers"
+    id = Column(Integer, primary_key=True, index=True)
+    schedule_item_id = Column(Integer, ForeignKey("schedule_items.id"), nullable=False, index=True)
+    teacher_id = Column(Integer, ForeignKey("teachers.id"), nullable=False, index=True)
+    slot_number = Column(Integer, default=1, nullable=False)  # Order: 1, 2, 3...
+    is_primary = Column(Boolean, default=True, nullable=False)  # Primary teacher flag
+
+    schedule_item = relationship("ScheduleItem", back_populates="teacher_assignments")
+    teacher = relationship("Teacher")
+
+
 class ScheduleItem(Base):
     __tablename__ = "schedule_items"
     id = Column(Integer, primary_key=True, index=True)
     group_id = Column(Integer, ForeignKey("groups.id"), nullable=False)
     subject_id = Column(Integer, ForeignKey("subjects.id"), nullable=False)
-    teacher_id = Column(Integer, ForeignKey("teachers.id"), nullable=False)
+    teacher_id = Column(Integer, ForeignKey("teachers.id"), nullable=False)  # Keep for backwards compat (primary teacher)
     room_id = Column(Integer, ForeignKey("rooms.id"), nullable=False)
     total_hours = Column(Float, nullable=False)
     weekly_hours = Column(Float, nullable=False)
     week_type = Column(String, default=WeekType.BALANCED.value, nullable=False)
+    teacher_slots = Column(Integer, default=1, nullable=False)  # How many teachers needed (1, 2, 3...)
+
     group = relationship("Group", back_populates="schedule_items")
     subject = relationship("Subject", back_populates="schedule_items")
-    teacher = relationship("Teacher", back_populates="schedule_items")
+    teacher = relationship("Teacher", back_populates="schedule_items")  # Primary teacher (deprecated)
     room = relationship("Room", back_populates="schedule_items")
+    teacher_assignments = relationship("ScheduleItemTeacher", back_populates="schedule_item", cascade="all, delete-orphan")
 
 
 class Holiday(Base):

@@ -205,6 +205,8 @@ class DayPlanCreateRequest(BaseModel):
     auto_vacant_remove: bool = False
     # Ignore weekly plan conflicts when building ad-hoc day plan
     ignore_weekly_conflicts: Optional[bool] = True
+    # If True, clears existing entries before creating new ones (default False to preserve existing entries)
+    clear_existing: Optional[bool] = False
     # Toggles for building a day plan (mostly affects from_plan=false)
     # Max pairs per group for this day
     max_pairs_per_day: Optional[int] = 4
@@ -419,6 +421,37 @@ class ScheduleQueryEntry(BaseModel):
 
 class ScheduleQueryResponse(BaseModel):
     items: List[ScheduleQueryEntry]
+
+
+# --- Replacement schemas ---
+class ReplaceTeacherRequest(BaseModel):
+    """Replace teacher in a specific time slot or for entire schedule item"""
+    date: Optional[date] = None  # Specific date (for single slot replacement)
+    start_time: Optional[str] = None  # Start time (for single slot replacement)
+    group_name: str
+    subject_name: str
+    old_teacher_name: str
+    new_teacher_name: str
+    # If date/start_time not provided, replaces for ALL occurrences of this schedule item
+
+
+class ReplaceSubjectRequest(BaseModel):
+    """Replace subject in a specific time slot"""
+    date: date
+    start_time: str
+    group_name: str
+    old_subject_name: str
+    new_subject_name: str
+
+
+class ReplaceRoomRequest(BaseModel):
+    """Replace room in a specific time slot or for entire schedule item"""
+    date: Optional[date] = None
+    start_time: Optional[str] = None
+    group_name: str
+    subject_name: str
+    old_room_name: str
+    new_room_name: str
 
 
 # Progress summary per group/subject

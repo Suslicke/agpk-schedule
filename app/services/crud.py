@@ -85,11 +85,40 @@ def get_or_create_room(db: Session, name: str):
     return room
 
 
+def get_schedule_item_teachers(schedule_item: models.ScheduleItem) -> List[models.Teacher]:
+    """Get all teachers assigned to a schedule item, ordered by slot_number"""
+    if not schedule_item.teacher_assignments:
+        # Fallback to legacy teacher_id
+        return [schedule_item.teacher] if schedule_item.teacher else []
+
+    return [assignment.teacher for assignment in sorted(
+        schedule_item.teacher_assignments,
+        key=lambda a: a.slot_number
+    )]
+
+
+def get_primary_teacher(schedule_item: models.ScheduleItem) -> models.Teacher:
+    """Get primary teacher for schedule item"""
+    if schedule_item.teacher_assignments:
+        primary = next((a.teacher for a in schedule_item.teacher_assignments if a.is_primary), None)
+        if primary:
+            return primary
+    return schedule_item.teacher
+
+
 def create_schedule_item(db: Session, item: schemas.ScheduleItemCreate):
     group = get_or_create_group(db, item.group_name)
     subject = get_or_create_subject(db, item.subject_name)
-    teacher = get_or_create_teacher(db, item.teacher_name)
     room = get_or_create_room(db, item.room_name)
+
+    # Split teachers by "/" - support multiple teachers per subject
+    teacher_names = [t.strip() for t in item.teacher_name.split('/') if t.strip()]
+    teachers = [get_or_create_teacher(db, name) for name in teacher_names]
+
+    if not teachers:
+        teachers = [get_or_create_teacher(db, 'Unknown')]
+
+    primary_teacher = teachers[0]
 
     existing = db.query(models.ScheduleItem).filter(
         and_(
@@ -109,21 +138,37 @@ def create_schedule_item(db: Session, item: schemas.ScheduleItemCreate):
     schedule_item = models.ScheduleItem(
         group_id=group.id,
         subject_id=subject.id,
-        teacher_id=teacher.id,
+        teacher_id=primary_teacher.id,  # Primary teacher for backwards compatibility
         room_id=room.id,
         total_hours=item.total_hours,
         weekly_hours=item.weekly_hours,
-        week_type=item.week_type
+        week_type=item.week_type,
+        teacher_slots=len(teachers)  # Number of teacher slots needed
     )
     db.add(schedule_item)
+    db.flush()  # Get ID before creating associations
+
+    # Create teacher assignments
+    for idx, teacher in enumerate(teachers):
+        assignment = models.ScheduleItemTeacher(
+            schedule_item_id=schedule_item.id,
+            teacher_id=teacher.id,
+            slot_number=idx + 1,
+            is_primary=(idx == 0)
+        )
+        db.add(assignment)
+
     db.commit()
     db.refresh(schedule_item)
+
+    teacher_list = "/".join(teacher_names)
     logger.info(
-        "Created ScheduleItem id=%s group=%s subject=%s teacher=%s room=%s total=%.2f weekly=%.2f week_type=%s",
+        "Created ScheduleItem id=%s group=%s subject=%s teachers=%s (%d slots) room=%s total=%.2f weekly=%.2f week_type=%s",
         schedule_item.id,
         item.group_name,
         item.subject_name,
-        item.teacher_name,
+        teacher_list,
+        len(teachers),
         item.room_name,
         item.total_hours,
         item.weekly_hours,
@@ -382,6 +427,161 @@ def create_schedules(db: Session, request: schemas.GenerateScheduleRequest, job_
     return gen_schedules
 
 
+def _assign_group_day_schedule(
+    group_items: List[models.ScheduleItem],
+    day_name: str,
+    day_date: date,
+    is_even: bool,
+    holiday_dates: set,
+    room_occupancy: defaultdict,
+    occupied_teacher: set,
+    occupied_group: set,
+    gym_teachers: defaultdict,
+    remaining_hours: Dict[int, float],
+    pair_size_ah: float,
+    min_pairs: int = 3,
+    max_pairs: int = 4,
+    enable_shifts: bool = True
+) -> List[Dict]:
+    """
+    Assign schedule for a specific group on a specific day.
+    Guarantees minimum `min_pairs` pairs per day if possible.
+    Returns list of assigned slots.
+    """
+    if not group_items:
+        return []
+
+    group_name = group_items[0].group.name
+    group_id = group_items[0].group_id
+
+    # Get time slots for this group
+    slots = _get_time_slots_for_group(group_name, enable_shifts)
+
+    # Sort items by remaining hours (descending) to prioritize subjects with more hours
+    sorted_items = sorted(group_items, key=lambda it: remaining_hours.get(it.id, 0), reverse=True)
+
+    assigned_slots = []
+    used_slot_times = set()
+
+    # Phase 1: Ensure minimum pairs (priority)
+    for item in sorted_items:
+        if len(assigned_slots) >= min_pairs:
+            break
+
+        weekly_ah = item.weekly_hours
+        hours = _distribute_hours(weekly_ah, item.week_type, is_even, pair_size_ah)
+
+        if hours <= 0 or remaining_hours.get(item.id, 0) <= 0:
+            continue
+
+        # Try to assign one pair from this subject
+        for slot in slots:
+            if slot["start"] in used_slot_times:
+                continue
+
+            # Check conflicts
+            teacher_key = (day_date, slot["start"], item.teacher_id)
+            group_key = (day_date, slot["start"], item.group_id)
+            room_key = (day_date, slot["start"], item.room_id)
+
+            capacity = 4 if "Спортзал" in item.room.name else 1
+            if "Спортзал" in item.room.name:
+                gym_key = (day_date, slot["start"], item.room_id)
+                if item.teacher_id in gym_teachers[gym_key]:
+                    continue
+                if room_occupancy[room_key] >= capacity:
+                    continue
+                gym_teachers[gym_key].add(item.teacher_id)
+            else:
+                if room_occupancy[room_key] >= capacity:
+                    continue
+
+            if teacher_key in occupied_teacher or group_key in occupied_group:
+                continue
+
+            # Assign this slot
+            assigned_slots.append({
+                "day": day_name,
+                "start_time": slot["start"],
+                "end_time": slot["end"],
+                "subject_name": item.subject.name,
+                "teacher_name": item.teacher.name,
+                "room_name": item.room.name,
+                "group_name": group_name,
+                "schedule_item_id": item.id
+            })
+
+            # Mark as occupied
+            occupied_teacher.add(teacher_key)
+            occupied_group.add(group_key)
+            room_occupancy[room_key] += 1
+            used_slot_times.add(slot["start"])
+            remaining_hours[item.id] -= pair_size_ah
+
+            break  # Move to next subject after assigning one pair
+
+    # Phase 2: Fill up to max_pairs if we have remaining hours
+    if len(assigned_slots) < max_pairs:
+        for item in sorted_items:
+            if len(assigned_slots) >= max_pairs:
+                break
+
+            if remaining_hours.get(item.id, 0) <= 0:
+                continue
+
+            # Try to assign additional pairs from this subject
+            for slot in slots:
+                if slot["start"] in used_slot_times:
+                    continue
+                if len(assigned_slots) >= max_pairs:
+                    break
+
+                # Check conflicts
+                teacher_key = (day_date, slot["start"], item.teacher_id)
+                group_key = (day_date, slot["start"], item.group_id)
+                room_key = (day_date, slot["start"], item.room_id)
+
+                capacity = 4 if "Спортзал" in item.room.name else 1
+                if "Спортзал" in item.room.name:
+                    gym_key = (day_date, slot["start"], item.room_id)
+                    if item.teacher_id in gym_teachers[gym_key]:
+                        continue
+                    if room_occupancy[room_key] >= capacity:
+                        continue
+                    gym_teachers[gym_key].add(item.teacher_id)
+                else:
+                    if room_occupancy[room_key] >= capacity:
+                        continue
+
+                if teacher_key in occupied_teacher or group_key in occupied_group:
+                    continue
+
+                # Assign this slot
+                assigned_slots.append({
+                    "day": day_name,
+                    "start_time": slot["start"],
+                    "end_time": slot["end"],
+                    "subject_name": item.subject.name,
+                    "teacher_name": item.teacher.name,
+                    "room_name": item.room.name,
+                    "group_name": group_name,
+                    "schedule_item_id": item.id
+                })
+
+                occupied_teacher.add(teacher_key)
+                occupied_group.add(group_key)
+                room_occupancy[room_key] += 1
+                used_slot_times.add(slot["start"])
+                remaining_hours[item.id] -= pair_size_ah
+
+    logger.debug(
+        "Assigned %d pairs for group=%s on %s (min=%d, max=%d)",
+        len(assigned_slots), group_name, day_name, min_pairs, max_pairs
+    )
+
+    return assigned_slots
+
+
 def fill_schedules(db: Session, gen_schedules: List[models.GeneratedSchedule], request: schemas.GenerateScheduleRequest):
     logger.info(
         "Filling schedules: %s -> %s, semester=%s, enable_shifts=%s, min_pairs=%s, max_pairs=%s, preferred_days=%s, concentrate=%s",
@@ -456,6 +656,15 @@ def fill_schedules(db: Session, gen_schedules: List[models.GeneratedSchedule], r
             except ValueError:
                 continue
 
+    # Group items by group_id for efficient processing
+    items_by_group = defaultdict(list)
+    for item in all_items:
+        items_by_group[item.group_id].append(item)
+
+    pair_size_ah = request.pair_size_academic_hours or PAIR_SIZE_AH
+    min_pairs = 3  # ALWAYS minimum 3 pairs per day per group
+    max_pairs = request.max_pairs_per_day or 4
+
     current_date = request.start_date
     while current_date <= request.end_date:
         # Determine week parity base
@@ -468,72 +677,116 @@ def fill_schedules(db: Session, gen_schedules: List[models.GeneratedSchedule], r
         week_number = (current_date - base_date).days // 7
         is_even = (week_number % 2 == 0)
         week_end = min(current_date + timedelta(days=6 - current_date.weekday()), request.end_date)
-        random.shuffle(all_items)
+
         distributions = []
-        logger.info("Planning week %s..%s (even=%s)", current_date, week_end, is_even)
-        for item in all_items:
-            # Check if group is on practice during this week - skip if so
-            # We need to check each day in the week for practice
+        logger.info("Planning week %s..%s (even=%s) - GROUP-BASED APPROACH", current_date, week_end, is_even)
+
+        # Process each group separately
+        for group_id, group_items in items_by_group.items():
+            if not group_items:
+                continue
+
+            group_name = group_items[0].group.name
+
+            # Check if group is on practice during this week
             week_has_practice = False
             check_date = current_date
             while check_date <= week_end:
-                if is_group_on_practice(db, item.group_id, check_date):
+                if is_group_on_practice(db, group_id, check_date):
                     week_has_practice = True
                     logger.info("Group %s (id=%s) is on practice during week %s-%s, skipping",
-                               item.group.name, item.group_id, current_date, week_end)
+                               group_name, group_id, current_date, week_end)
                     break
                 check_date += timedelta(days=1)
 
             if week_has_practice:
                 continue
 
-            # Pair size may be overridden per request
-            pair_size_ah = request.pair_size_academic_hours or PAIR_SIZE_AH
-            # Always use weekly hours - don't limit by remaining to allow generation even when exceeded
-            weekly_ah = item.weekly_hours
-            hours = _distribute_hours(weekly_ah, item.week_type, is_even, pair_size_ah)
-            # Note: We continue generation even if hours are exceeded to create a complete plan
-            logger.debug(
-                "Item id=%s group=%s subject=%s weekly=%.2f -> hours_this_week=%.2f remaining_before=%.2f",
-                item.id,
-                item.group.name,
-                item.subject.name,
-                item.weekly_hours,
-                hours,
-                remaining_hours[item.id],
-            )
-            daily_schedule = _assign_daily_schedule(
-                hours, current_date, week_end, is_even, item, holiday_dates,
-                room_occupancy, occupied_teacher, occupied_group, gym_teachers,
-                min_pairs_per_day=request.min_pairs_per_day or 0,
-                max_pairs_per_day=request.max_pairs_per_day or 4,
-                preferred_days=request.preferred_days,
-                concentrate_on_preferred_days=bool(request.concentrate_on_preferred_days),
-                enable_shifts=bool(request.enable_shifts),
-                pair_size_ah=pair_size_ah,
-            )
-            if daily_schedule:
-                actual_ah = len(daily_schedule) * pair_size_ah
-                remaining_hours[item.id] -= actual_ah
-                logger.debug(
-                    "Planned %d slots (%.1f AH) for item id=%s; remaining=%.1f",
-                    len(daily_schedule),
-                    actual_ah,
-                    item.id,
-                    remaining_hours[item.id],
+            # Get available days for this week
+            available_days = []
+            for i in range((week_end - current_date).days + 1):
+                day_date = current_date + timedelta(days=i)
+                if not _is_holiday(day_date, request.holidays, holiday_dates):
+                    day_index = day_date.weekday()
+                    if day_index < len(days):
+                        available_days.append((days[day_index], day_date))
+
+            if not available_days:
+                logger.warning("No available days for group %s in week %s", group_name, current_date)
+                continue
+
+            logger.info("Group %s: planning %d days with min=%d, max=%d pairs/day",
+                       group_name, len(available_days), min_pairs, max_pairs)
+
+            # Track which items have been assigned on which days
+            item_day_assignments = defaultdict(list)  # {item_id: [day_dates]}
+
+            # Process each day for this group
+            for day_name, day_date in available_days:
+                # Use new group-day scheduling function
+                assigned_slots = _assign_group_day_schedule(
+                    group_items=group_items,
+                    day_name=day_name,
+                    day_date=day_date,
+                    is_even=is_even,
+                    holiday_dates=holiday_dates,
+                    room_occupancy=room_occupancy,
+                    occupied_teacher=occupied_teacher,
+                    occupied_group=occupied_group,
+                    gym_teachers=gym_teachers,
+                    remaining_hours=remaining_hours,
+                    pair_size_ah=pair_size_ah,
+                    min_pairs=min_pairs,
+                    max_pairs=max_pairs,
+                    enable_shifts=bool(request.enable_shifts)
                 )
-                gen_sched = next(g for g in gen_schedules if g.group_id == item.group_id)
-                dist = models.WeeklyDistribution(
-                    generated_schedule_id=gen_sched.id,
-                    week_start=current_date,
-                    week_end=week_end,
-                    is_even_week=1 if is_even else 0,
-                    schedule_item_id=item.id,
-                    hours_even=hours if is_even else 0,
-                    hours_odd=hours if not is_even else 0,
-                    daily_schedule=daily_schedule
+
+                # Group slots by schedule_item_id for creating distributions
+                slots_by_item = defaultdict(list)
+                for slot in assigned_slots:
+                    item_id = slot.pop("schedule_item_id")
+                    slots_by_item[item_id].append(slot)
+                    item_day_assignments[item_id].append(day_date)
+
+                # Create WeeklyDistribution entries for this day's assignments
+                for item_id, day_slots in slots_by_item.items():
+                    item = next(it for it in group_items if it.id == item_id)
+
+                    # Find existing distribution for this item in this week
+                    existing_dist = next(
+                        (d for d in distributions if d.schedule_item_id == item_id),
+                        None
+                    )
+
+                    if existing_dist:
+                        # Append to existing distribution's daily_schedule
+                        if not existing_dist.daily_schedule:
+                            existing_dist.daily_schedule = []
+                        existing_dist.daily_schedule.extend(day_slots)
+                    else:
+                        # Create new distribution
+                        gen_sched = next(g for g in gen_schedules if g.group_id == group_id)
+                        weekly_ah = item.weekly_hours
+                        hours = _distribute_hours(weekly_ah, item.week_type, is_even, pair_size_ah)
+
+                        dist = models.WeeklyDistribution(
+                            generated_schedule_id=gen_sched.id,
+                            week_start=current_date,
+                            week_end=week_end,
+                            is_even_week=1 if is_even else 0,
+                            schedule_item_id=item_id,
+                            hours_even=hours if is_even else 0,
+                            hours_odd=hours if not is_even else 0,
+                            daily_schedule=day_slots
+                        )
+                        distributions.append(dist)
+
+                logger.info(
+                    "Group %s on %s: assigned %d pairs (target: min=%d, max=%d)",
+                    group_name, day_name, len(assigned_slots), min_pairs, max_pairs
                 )
-                distributions.append(dist)
+
+        # Save all distributions for this week
         for dist in distributions:
             db.add(dist)
         db.commit()
@@ -1041,38 +1294,42 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
             raise ValueError(f"Group {g.name} is on practice on {request.date}")
         target_groups = {g.id}
 
-    # Rebuild behavior: if group filter is provided, wipe all existing entries for this group; otherwise wipe all entries for the date
-    if target_groups:
-        # If this group's entries were approved earlier, do not allow overriding them
-        approved_for_group = (
-            db.query(models.DayScheduleEntry)
-            .filter(models.DayScheduleEntry.day_schedule_id == ds.id)
-            .filter(models.DayScheduleEntry.group_id.in_(target_groups))
-            .filter(models.DayScheduleEntry.status == "approved")
-            .first()
-        )
-        if approved_for_group:
-            raise ValueError("Day plan for this group on this date is approved and cannot be modified")
-        to_delete = (
-            db.query(models.DayScheduleEntry)
-            .filter(models.DayScheduleEntry.day_schedule_id == ds.id)
-            .filter(models.DayScheduleEntry.group_id.in_(target_groups))
-            .all()
-        )
+    # Clear existing entries only if clear_existing=True
+    if request.clear_existing:
+        logger.info("clear_existing=True: will delete existing entries before creating new ones")
+        if target_groups:
+            # If this group's entries were approved earlier, do not allow overriding them
+            approved_for_group = (
+                db.query(models.DayScheduleEntry)
+                .filter(models.DayScheduleEntry.day_schedule_id == ds.id)
+                .filter(models.DayScheduleEntry.group_id.in_(target_groups))
+                .filter(models.DayScheduleEntry.status == "approved")
+                .first()
+            )
+            if approved_for_group:
+                raise ValueError("Day plan for this group on this date is approved and cannot be modified")
+            to_delete = (
+                db.query(models.DayScheduleEntry)
+                .filter(models.DayScheduleEntry.day_schedule_id == ds.id)
+                .filter(models.DayScheduleEntry.group_id.in_(target_groups))
+                .all()
+            )
+        else:
+            to_delete = (
+                db.query(models.DayScheduleEntry)
+                .filter(models.DayScheduleEntry.day_schedule_id == ds.id)
+                .all()
+            )
+        if to_delete:
+            for e in to_delete:
+                db.delete(e)
+            # reset day status to pending on rebuild
+            ds.status = "pending"
+            db.add(ds)
+            db.commit()
+            db.refresh(ds)
     else:
-        to_delete = (
-            db.query(models.DayScheduleEntry)
-            .filter(models.DayScheduleEntry.day_schedule_id == ds.id)
-            .all()
-        )
-    if to_delete:
-        for e in to_delete:
-            db.delete(e)
-        # reset day status to pending on rebuild
-        ds.status = "pending"
-        db.add(ds)
-        db.commit()
-        db.refresh(ds)
+        logger.info("clear_existing=False: preserving existing entries, will only add new ones")
 
     # Build entries
     debug_notes: list[str] = []
