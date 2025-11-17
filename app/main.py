@@ -28,6 +28,8 @@ app = FastAPI(
     description="API для генерации, планирования и учета расписания",
     openapi_tags=tags_metadata,
     root_path="/api",
+    docs_url="/admin/docs",
+    redoc_url="/admin/redoc",
 )
 
 app.add_middleware(
