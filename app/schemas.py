@@ -406,7 +406,8 @@ class ScheduleQueryEntry(BaseModel):
     start_time: str
     end_time: str
     subject_name: str
-    teacher_name: str
+    teacher_name: str  # Legacy: first teacher or joined with "/"
+    teacher_names: Optional[List[str]] = None  # All teachers (supports multiple teachers per subject)
     room_name: str
     group_name: str
     # metadata for UI freshness and origin

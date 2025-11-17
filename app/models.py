@@ -149,13 +149,26 @@ class DaySchedule(Base):
     entries = relationship("DayScheduleEntry", back_populates="day_schedule", cascade="all, delete-orphan")
 
 
+class DayScheduleEntryTeacher(Base):
+    """Association table for many-to-many relationship between DayScheduleEntry and Teacher"""
+    __tablename__ = "day_schedule_entry_teachers"
+    id = Column(Integer, primary_key=True, index=True)
+    entry_id = Column(Integer, ForeignKey("day_schedule_entries.id", ondelete="CASCADE"), nullable=False, index=True)
+    teacher_id = Column(Integer, ForeignKey("teachers.id"), nullable=False, index=True)
+    slot_number = Column(Integer, default=1, nullable=False)  # Order: 1, 2, 3...
+    is_primary = Column(Boolean, default=True, nullable=False)  # Primary teacher flag
+
+    entry = relationship("DayScheduleEntry", back_populates="teacher_assignments")
+    teacher = relationship("Teacher")
+
+
 class DayScheduleEntry(Base):
     __tablename__ = "day_schedule_entries"
     id = Column(Integer, primary_key=True, index=True)
     day_schedule_id = Column(Integer, ForeignKey("day_schedules.id"), nullable=False, index=True)
     group_id = Column(Integer, ForeignKey("groups.id"), nullable=False, index=True)
     subject_id = Column(Integer, ForeignKey("subjects.id"), nullable=False, index=True)
-    teacher_id = Column(Integer, ForeignKey("teachers.id"), nullable=True, index=True)
+    teacher_id = Column(Integer, ForeignKey("teachers.id"), nullable=True, index=True)  # Keep for backwards compat (primary teacher)
     room_id = Column(Integer, ForeignKey("rooms.id"), nullable=False, index=True)
     start_time = Column(String, nullable=False)
     end_time = Column(String, nullable=False)
@@ -163,6 +176,7 @@ class DayScheduleEntry(Base):
     schedule_item_id = Column(Integer, ForeignKey("schedule_items.id"), nullable=True, index=True)
 
     day_schedule = relationship("DaySchedule", back_populates="entries")
+    teacher_assignments = relationship("DayScheduleEntryTeacher", back_populates="entry", cascade="all, delete-orphan")
 
 
 # Practice periods for groups

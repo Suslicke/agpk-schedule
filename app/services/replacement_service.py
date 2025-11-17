@@ -20,7 +20,7 @@ def replace_teacher(db: Session, request: schemas.ReplaceTeacherRequest) -> dict
     if not old_teacher:
         raise ValueError(f"Old teacher '{request.old_teacher_name}' not found")
 
-    new_teacher = get_or_create_teacher(db, request.new_teacher_name)
+    new_teacher = get_or_create_teacher(db, request.new_teacher_name)  # Will raise if contains '/'
     group = db.query(models.Group).filter(models.Group.name == request.group_name).first()
     if not group:
         raise ValueError(f"Group '{request.group_name}' not found")

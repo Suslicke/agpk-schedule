@@ -64,6 +64,14 @@ def get_or_create_subject(db: Session, name: str):
 
 
 def get_or_create_teacher(db: Session, name: str):
+    # Prevent creating teachers with "/" in name - they should be split before calling this function
+    if '/' in name:
+        raise ValueError(
+            f"Teacher name cannot contain '/'. "
+            f"Split '{name}' into individual teachers before calling get_or_create_teacher(). "
+            f"Use: [t.strip() for t in name.split('/')]"
+        )
+
     teacher = db.query(models.Teacher).filter(models.Teacher.name == name).first()
     if not teacher:
         teacher = models.Teacher(name=name)
@@ -93,6 +101,21 @@ def get_schedule_item_teachers(schedule_item: models.ScheduleItem) -> List[model
 
     return [assignment.teacher for assignment in sorted(
         schedule_item.teacher_assignments,
+        key=lambda a: a.slot_number
+    )]
+
+
+def get_day_entry_teachers(db: Session, entry: models.DayScheduleEntry) -> List[models.Teacher]:
+    """Get all teachers assigned to a day schedule entry, ordered by slot_number"""
+    if not entry.teacher_assignments or len(entry.teacher_assignments) == 0:
+        # Fallback to legacy teacher_id
+        if entry.teacher_id:
+            teacher = db.query(models.Teacher).get(entry.teacher_id)
+            return [teacher] if teacher else []
+        return []
+
+    return [assignment.teacher for assignment in sorted(
+        entry.teacher_assignments,
         key=lambda a: a.slot_number
     )]
 
@@ -190,7 +213,7 @@ def parse_and_create_schedule_items(db: Session, df: pd.DataFrame):
             subject = str(row.iloc[2]).strip()
             total = float(row.iloc[3]) if not pd.isna(row.iloc[3]) else 0.0
             weekly = float(row.iloc[4]) if not pd.isna(row.iloc[4]) else 0.0
-            teacher = (str(row.iloc[5]).strip() if not pd.isna(row.iloc[5]) else 'Unknown')
+            teacher_raw = (str(row.iloc[5]).strip() if not pd.isna(row.iloc[5]) else 'Unknown')
             room = (str(row.iloc[6]).strip() if not pd.isna(row.iloc[6]) else 'Unknown')
             week_side = row.iloc[7] if len(row) > 7 and not pd.isna(row.iloc[7]) else None
 
@@ -200,22 +223,29 @@ def parse_and_create_schedule_items(db: Session, df: pd.DataFrame):
             elif week_side == 'левая':
                 week_type = WeekType.odd_priority
 
+            # Keep raw teacher string - create_schedule_item will split it internally
             item = schemas.ScheduleItemCreate(
                 group_name=str(current_group).strip(),
                 subject_name=subject,
-                teacher_name=teacher,
+                teacher_name=teacher_raw,
                 room_name=room,
                 total_hours=total,
                 weekly_hours=weekly,
                 week_type=week_type,
             )
             created = create_schedule_item(db, item)
-            # Also establish Group-Teacher-Subject mapping for replacements if teacher is not a placeholder
-            try:
-                if not _is_placeholder_teacher_name(teacher):
-                    link_group_teacher_subject(db, current_group, teacher, subject)
-            except Exception as ex:
-                logger.warning("Failed to create G-T-S link for %s / %s / %s: %s", current_group, teacher, subject, ex)
+
+            # Establish Group-Teacher-Subject mapping for EACH teacher separately
+            # Split by "/" to create individual links (prevents creating teachers with "/" in name)
+            teacher_names = [t.strip() for t in teacher_raw.split('/') if t.strip()]
+            for teacher_name in teacher_names:
+                try:
+                    if not _is_placeholder_teacher_name(teacher_name):
+                        link_group_teacher_subject(db, current_group, teacher_name, subject)
+                        logger.debug("Created G-T-S link: %s / %s / %s", current_group, teacher_name, subject)
+                except Exception as ex:
+                    logger.warning("Failed to create G-T-S link for %s / %s / %s: %s", current_group, teacher_name, subject, ex)
+
             schedule_items.append(created)
     logger.info("Parsed and created %d schedule items", len(schedule_items))
     return schedule_items
@@ -479,40 +509,60 @@ def _assign_group_day_schedule(
             if slot["start"] in used_slot_times:
                 continue
 
-            # Check conflicts
-            teacher_key = (day_date, slot["start"], item.teacher_id)
+            # Get ALL teachers for this item (supports multiple teachers per subject)
+            teachers = get_schedule_item_teachers(item)
+
+            # Check if ALL teachers are free (required for pairs with multiple teachers)
+            all_teachers_free = True
+            teacher_keys = []
+            for teacher in teachers:
+                teacher_key = (day_date, slot["start"], teacher.id)
+                if teacher_key in occupied_teacher:
+                    all_teachers_free = False
+                    break
+                teacher_keys.append(teacher_key)
+
+            if not all_teachers_free:
+                continue
+
+            # Check room and group conflicts
             group_key = (day_date, slot["start"], item.group_id)
             room_key = (day_date, slot["start"], item.room_id)
 
             capacity = 4 if "Спортзал" in item.room.name else 1
             if "Спортзал" in item.room.name:
                 gym_key = (day_date, slot["start"], item.room_id)
-                if item.teacher_id in gym_teachers[gym_key]:
+                # Check if any teacher already in gym
+                teachers_in_gym = any(t.id in gym_teachers[gym_key] for t in teachers)
+                if teachers_in_gym or room_occupancy[room_key] >= capacity:
                     continue
-                if room_occupancy[room_key] >= capacity:
-                    continue
-                gym_teachers[gym_key].add(item.teacher_id)
+                # Add all teachers to gym
+                for teacher in teachers:
+                    gym_teachers[gym_key].add(teacher.id)
             else:
                 if room_occupancy[room_key] >= capacity:
                     continue
 
-            if teacher_key in occupied_teacher or group_key in occupied_group:
+            if group_key in occupied_group:
                 continue
 
-            # Assign this slot
+            # Assign this slot with ALL teachers
+            teacher_names = [t.name for t in teachers]
             assigned_slots.append({
                 "day": day_name,
                 "start_time": slot["start"],
                 "end_time": slot["end"],
                 "subject_name": item.subject.name,
-                "teacher_name": item.teacher.name,
+                "teacher_names": teacher_names,  # List of all teachers
+                "teacher_ids": [t.id for t in teachers],  # Keep IDs for DB creation
                 "room_name": item.room.name,
                 "group_name": group_name,
                 "schedule_item_id": item.id
             })
 
-            # Mark as occupied
-            occupied_teacher.add(teacher_key)
+            # Mark ALL teachers as occupied
+            for teacher_key in teacher_keys:
+                occupied_teacher.add(teacher_key)
             occupied_group.add(group_key)
             room_occupancy[room_key] += 1
             used_slot_times.add(slot["start"])
@@ -536,39 +586,58 @@ def _assign_group_day_schedule(
                 if len(assigned_slots) >= max_pairs:
                     break
 
-                # Check conflicts
-                teacher_key = (day_date, slot["start"], item.teacher_id)
+                # Get ALL teachers for this item
+                teachers = get_schedule_item_teachers(item)
+
+                # Check if ALL teachers are free
+                all_teachers_free = True
+                teacher_keys = []
+                for teacher in teachers:
+                    teacher_key = (day_date, slot["start"], teacher.id)
+                    if teacher_key in occupied_teacher:
+                        all_teachers_free = False
+                        break
+                    teacher_keys.append(teacher_key)
+
+                if not all_teachers_free:
+                    continue
+
+                # Check room and group conflicts
                 group_key = (day_date, slot["start"], item.group_id)
                 room_key = (day_date, slot["start"], item.room_id)
 
                 capacity = 4 if "Спортзал" in item.room.name else 1
                 if "Спортзал" in item.room.name:
                     gym_key = (day_date, slot["start"], item.room_id)
-                    if item.teacher_id in gym_teachers[gym_key]:
+                    teachers_in_gym = any(t.id in gym_teachers[gym_key] for t in teachers)
+                    if teachers_in_gym or room_occupancy[room_key] >= capacity:
                         continue
-                    if room_occupancy[room_key] >= capacity:
-                        continue
-                    gym_teachers[gym_key].add(item.teacher_id)
+                    for teacher in teachers:
+                        gym_teachers[gym_key].add(teacher.id)
                 else:
                     if room_occupancy[room_key] >= capacity:
                         continue
 
-                if teacher_key in occupied_teacher or group_key in occupied_group:
+                if group_key in occupied_group:
                     continue
 
-                # Assign this slot
+                # Assign this slot with ALL teachers
+                teacher_names = [t.name for t in teachers]
                 assigned_slots.append({
                     "day": day_name,
                     "start_time": slot["start"],
                     "end_time": slot["end"],
                     "subject_name": item.subject.name,
-                    "teacher_name": item.teacher.name,
+                    "teacher_names": teacher_names,  # List of all teachers
+                    "teacher_ids": [t.id for t in teachers],  # Keep IDs for DB creation
                     "room_name": item.room.name,
                     "group_name": group_name,
                     "schedule_item_id": item.id
                 })
 
-                occupied_teacher.add(teacher_key)
+                # Mark ALL teachers as occupied
+                for teacher_key in teacher_keys:
+                    occupied_teacher.add(teacher_key)
                 occupied_group.add(group_key)
                 room_occupancy[room_key] += 1
                 used_slot_times.add(slot["start"])
@@ -1368,18 +1437,29 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
                         f"Пропущено: у группы {db.query(models.Group).get(item.group_id).name} уже есть пара в {slot['start_time']}"
                     )
                     continue
-                # Check teacher availability within this day's plan only (ignore weekly by default)
-                if not _teacher_is_free(db, item.teacher_id, request.date, slot["start_time"], slot["end_time"], ignore_weekly=True):
-                    tname = db.query(models.Teacher).get(item.teacher_id).name
+                # Get all teachers for this item (supports multiple teachers per subject)
+                teachers = get_schedule_item_teachers(item)
+
+                # Check ALL teachers' availability
+                all_teachers_free = True
+                busy_teachers = []
+                for teacher in teachers:
+                    if not _teacher_is_free(db, teacher.id, request.date, slot["start_time"], slot["end_time"], ignore_weekly=True):
+                        all_teachers_free = False
+                        busy_teachers.append(teacher.name)
+
+                if not all_teachers_free:
                     debug_notes.append(
-                        f"Пропущено: преподаватель занят в дневном плане {tname} на {slot['start_time']}"
+                        f"Пропущено: преподаватели заняты в дневном плане: {', '.join(busy_teachers)} на {slot['start_time']}"
                     )
                     continue
+
+                # Create entry with primary teacher
                 entry = models.DayScheduleEntry(
                     day_schedule_id=ds.id,
                     group_id=item.group_id,
                     subject_id=item.subject_id,
-                    teacher_id=item.teacher_id,
+                    teacher_id=teachers[0].id if teachers else None,  # Primary teacher
                     room_id=item.room_id,
                     start_time=slot["start_time"],
                     end_time=slot["end_time"],
@@ -1387,8 +1467,21 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
                     schedule_item_id=item.id,
                 )
                 db.add(entry)
+                db.flush()  # Get entry.id
+
+                # Create teacher assignments for ALL teachers
+                for idx, teacher in enumerate(teachers):
+                    teacher_assignment = models.DayScheduleEntryTeacher(
+                        entry_id=entry.id,
+                        teacher_id=teacher.id,
+                        slot_number=idx + 1,
+                        is_primary=(idx == 0)
+                    )
+                    db.add(teacher_assignment)
+
+                teacher_names = "/".join([t.name for t in teachers])
                 debug_notes.append(
-                    f"Добавлено из недельного плана: {db.query(models.Group).get(item.group_id).name} — {db.query(models.Subject).get(item.subject_id).name} ({db.query(models.Teacher).get(item.teacher_id).name}) {db.query(models.Room).get(item.room_id).name} {slot['start_time']}-{slot['end_time']}"
+                    f"Добавлено из недельного плана: {db.query(models.Group).get(item.group_id).name} — {db.query(models.Subject).get(item.subject_id).name} ({teacher_names}) {db.query(models.Room).get(item.room_id).name} {slot['start_time']}-{slot['end_time']}"
                 )
         db.commit()
         # Enforce no-gaps and optional cap for every group present in the day (or only target groups if set)
@@ -1569,16 +1662,25 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
                         room_name = room.name if room else str(it.room_id)
                         reasons_for_slot.append(f"Аудитория заполнена: {room_name}")
                         continue
-                    # Teacher availability
-                    if not _teacher_is_free(db, it.teacher_id, request.date, start, end, ignore_weekly=bool(request.ignore_weekly_conflicts)):
-                        teacher_name = db.query(models.Teacher).get(it.teacher_id).name
-                        reasons_for_slot.append(f"Преподаватель занят: {teacher_name}")
+                    # Check ALL teachers availability (supports multiple teachers per subject)
+                    teachers_for_item = get_schedule_item_teachers(it)
+                    all_teachers_free = True
+                    busy_teacher_names = []
+                    for teacher in teachers_for_item:
+                        if not _teacher_is_free(db, teacher.id, request.date, start, end, ignore_weekly=bool(request.ignore_weekly_conflicts)):
+                            all_teachers_free = False
+                            busy_teacher_names.append(teacher.name)
+                    if not all_teachers_free:
+                        reasons_for_slot.append(f"Преподаватели заняты: {', '.join(busy_teacher_names)}")
                         continue
-                    # If sports hall, avoid assigning same teacher multiple classes in same slot
-                    if room and "Спортзал" in room.name and it.teacher_id in gym_teachers[gym_key]:
-                        teacher_name = db.query(models.Teacher).get(it.teacher_id).name
-                        reasons_for_slot.append(f"Спортзал: преподаватель уже назначен в этом слоте: {teacher_name}")
-                        continue
+
+                    # If sports hall, check no teacher is already assigned in this slot
+                    if room and "Спортзал" in room.name:
+                        teachers_already_in_gym = [t.name for t in teachers_for_item if t.id in gym_teachers[gym_key]]
+                        if teachers_already_in_gym:
+                            reasons_for_slot.append(f"Спортзал: преподаватели уже назначены: {', '.join(teachers_already_in_gym)}")
+                            continue
+
                     picked_item = it
                     break
                 if not picked_item:
@@ -1593,12 +1695,13 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
                         break
                     # Not started yet: try next slot (we will start later, which is not an internal window)
                     continue
-                # Create entry
+                # Create entry with ALL teachers
+                teachers_for_picked = get_schedule_item_teachers(picked_item)
                 e = models.DayScheduleEntry(
                     day_schedule_id=ds.id,
                     group_id=gid,
                     subject_id=picked_item.subject_id,
-                    teacher_id=picked_item.teacher_id,
+                    teacher_id=teachers_for_picked[0].id if teachers_for_picked else None,  # Primary teacher
                     room_id=picked_item.room_id,
                     start_time=start,
                     end_time=end,
@@ -1606,15 +1709,29 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
                     schedule_item_id=picked_item.id,
                 )
                 db.add(e)
-                # Update occupancies
-                teacher_key = (request.date, start, picked_item.teacher_id)
+                db.flush()  # Get entry.id
+
+                # Create teacher assignments for ALL teachers
+                for idx, teacher in enumerate(teachers_for_picked):
+                    teacher_assignment = models.DayScheduleEntryTeacher(
+                        entry_id=e.id,
+                        teacher_id=teacher.id,
+                        slot_number=idx + 1,
+                        is_primary=(idx == 0)
+                    )
+                    db.add(teacher_assignment)
+
+                # Update occupancies for ALL teachers
                 group_key = (request.date, start, gid)
                 room_key = (request.date, start, picked_item.room_id)
-                occupied_teacher.add(teacher_key)
+                for teacher in teachers_for_picked:
+                    teacher_key = (request.date, start, teacher.id)
+                    occupied_teacher.add(teacher_key)
+                    if room and "Спортзал" in room.name:
+                        gym_teachers[(request.date, start, picked_item.room_id)].add(teacher.id)
+
                 occupied_group.add(group_key)
                 room_occupancy[room_key] += 1
-                if room and "Спортзал" in room.name:
-                    gym_teachers[(request.date, start, picked_item.room_id)].add(picked_item.teacher_id)
                 total_added += 1
                 subj_repeat[picked_item.subject_id] += 1
                 started = True
