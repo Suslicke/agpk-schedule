@@ -1,6 +1,7 @@
-from typing import List, Dict
 from collections import defaultdict
 from datetime import date, timedelta
+from typing import List
+
 from sqlalchemy.orm import Session
 
 from app import models, schemas

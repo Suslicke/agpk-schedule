@@ -1,11 +1,13 @@
 import logging
-import pandas as pd
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
-from sqlalchemy.orm import Session
-from app.services import crud
-from app.core.database import get_db
 from io import BytesIO
+
+import pandas as pd
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from sqlalchemy.orm import Session
+
+from app.core.database import get_db
 from app.core.security import require_admin
+from app.services import crud
 
 router = APIRouter(prefix="/upload", tags=["upload"])
 logger = logging.getLogger(__name__)

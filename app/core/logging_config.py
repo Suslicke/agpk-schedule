@@ -1,14 +1,14 @@
+import contextvars
 import logging
 import logging.config
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
 import time
 import uuid
-import contextvars
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
-
 
 # Context variable to store request ID per request
 request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
@@ -18,7 +18,7 @@ class RequestIdFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
         # Attach current request id to the record
         rid = request_id_var.get("-")
-        setattr(record, "request_id", rid)
+        record.request_id = rid
         return True
 
 

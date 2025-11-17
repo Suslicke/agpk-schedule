@@ -1,12 +1,13 @@
 from pydantic import BaseModel, Field
+
 try:
     # pydantic v2
     from pydantic import AliasChoices
 except Exception:
     AliasChoices = None  # type: ignore
-from typing import Optional, List, Dict
-from enum import Enum
 from datetime import date
+from enum import Enum
+from typing import List, Optional
 
 
 class WeekType(str, Enum):
@@ -55,7 +56,7 @@ class GenerateScheduleRequest(BaseModel):
     # Tuning toggles
     min_pairs_per_day: Optional[int] = 0
     max_pairs_per_day: Optional[int] = 4
-    # Prefer packing classes onto these weekdays first (e.g., ["Tuesday", "Thursday"]) 
+    # Prefer packing classes onto these weekdays first (e.g., ["Tuesday", "Thursday"])
     preferred_days: Optional[List[str]] = None
     # If true, attempt to concentrate weekly load on preferred days
     concentrate_on_preferred_days: Optional[bool] = False

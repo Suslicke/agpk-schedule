@@ -1,10 +1,11 @@
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
-from app.core.database import init_db
-from app.api.routers import schedule, upload, progress, dictionary, admin, export, analytics, practice
+
+from app.api.routers import admin, analytics, dictionary, export, practice, progress, schedule, upload
 from app.core.config import settings
-from app.core.logging_config import setup_logging, RequestIdMiddleware
-from app.core.monitoring import MetricsMiddleware, get_metrics, get_dashboard_stats, CONTENT_TYPE_LATEST
+from app.core.database import init_db
+from app.core.logging_config import RequestIdMiddleware, setup_logging
+from app.core.monitoring import CONTENT_TYPE_LATEST, MetricsMiddleware, get_dashboard_stats, get_metrics
 
 setup_logging(
     level=settings.log_level,

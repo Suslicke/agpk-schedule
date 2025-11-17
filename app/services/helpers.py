@@ -1,12 +1,11 @@
 from __future__ import annotations
-from datetime import date, timedelta
-from typing import List, Set, Dict
-import math
-import random
-from collections import defaultdict
 
-from app.core.config import settings
+import math
+from datetime import date, timedelta
+from typing import Dict, List, Set
+
 from app import models
+from app.core.config import settings
 from app.schemas import WeekType
 
 # Public constants reused across services

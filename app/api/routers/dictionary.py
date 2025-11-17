@@ -1,12 +1,13 @@
+from typing import Dict, List
+
 from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
-from typing import List, Dict
-from app.core.database import get_db
-from app import models
-from app import schemas
-from app.services import crud
-from app.core.security import require_admin
 from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from app import models, schemas
+from app.core.database import get_db
+from app.core.security import require_admin
+from app.services import crud
 
 router = APIRouter(prefix="/dict", tags=["dictionary"])
 

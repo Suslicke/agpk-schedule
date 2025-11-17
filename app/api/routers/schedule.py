@@ -1,14 +1,16 @@
 import logging
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from datetime import datetime
+from typing import Dict, Optional
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from app.services import schedule_service as sched_svc
-from app.services import day_planning_service as day_svc
+
 from app import schemas
-from app.core.database import get_db, SessionLocal
-from datetime import datetime, date
-from typing import List, Dict, Optional
+from app.core.database import SessionLocal, get_db
 from app.core.security import require_admin
+from app.services import day_planning_service as day_svc
+from app.services import schedule_service as sched_svc
 
 router = APIRouter(prefix="/schedule", tags=["schedule"])
 logger = logging.getLogger(__name__)

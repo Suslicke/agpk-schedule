@@ -3,7 +3,8 @@
 Thin wrappers around legacy functions in app.services.crud.
 """
 from datetime import date
-from typing import Optional, List
+from typing import Optional
+
 from sqlalchemy.orm import Session
 
 from app import schemas

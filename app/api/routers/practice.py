@@ -1,12 +1,13 @@
 import logging
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from app.services import crud
+
 from app import schemas
 from app.core.database import get_db
-from datetime import date
-from typing import Optional
 from app.core.security import require_admin
+from app.services import crud
 
 router = APIRouter(prefix="/practice", tags=["practice"])
 logger = logging.getLogger(__name__)

@@ -1,12 +1,14 @@
 import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+
+from app import schemas
 from app.core.database import get_db
 from app.core.security import require_admin
-from app import schemas
 from app.services import analytics_service as analytics
 
-router = APIRouter(prefix="/analytics", tags=["analytics"]) 
+router = APIRouter(prefix="/analytics", tags=["analytics"])
 logger = logging.getLogger(__name__)
 
 

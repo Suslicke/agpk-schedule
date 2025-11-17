@@ -1,14 +1,15 @@
-from io import BytesIO
-from typing import Optional, List, Dict, Tuple
-import pandas as pd
-from datetime import date, timedelta
 from collections import defaultdict
-from sqlalchemy.orm import Session
-from openpyxl.styles import PatternFill, Font
-from openpyxl.utils import get_column_letter
+from datetime import date, timedelta
+from io import BytesIO
+from typing import Dict, List, Optional, Tuple
 
-from app import models, schemas
-from app.services.helpers import days, _get_week_start, PAIR_SIZE_AH
+import pandas as pd
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
+from sqlalchemy.orm import Session
+
+from app import models
+from app.services.helpers import PAIR_SIZE_AH, _get_week_start, days
 
 
 def _safe_sheet_name(base: str) -> str:
@@ -345,7 +346,6 @@ def build_day_with_diff_excel(db: Session, date_: date, group_name: Optional[str
         ])).to_excel(writer, index=False, sheet_name="Hours Summary")
 
         # Apply formatting for Diff sheet
-        wb = writer.book
         ws = writer.sheets.get("Diff")
         if ws is not None:
             _apply_diff_formatting(ws)
@@ -504,7 +504,7 @@ def build_schedule_range_excel(
                 if ws is not None:
                     _apply_diff_formatting(ws)
         else:
-            groups = sorted(set(r["group_name"] for r in (plan_rows + actual_rows)))
+            groups = sorted({r["group_name"] for r in (plan_rows + actual_rows)})
             for gname in groups:
                 g_plan = [r for r in plan_rows if r["group_name"] == gname]
                 g_actual = [r for r in actual_rows if r["group_name"] == gname]

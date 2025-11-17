@@ -1,10 +1,12 @@
 import logging
+from typing import List
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from typing import List
-from app.services import crud
+
 from app import schemas
 from app.core.database import get_db
+from app.services import crud
 
 router = APIRouter(prefix="/progress", tags=["progress"])
 logger = logging.getLogger(__name__)

@@ -1,16 +1,18 @@
 import logging
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks, Query
-from typing import Optional, Dict
+from io import BytesIO
+from typing import Dict, Optional
+
+import pandas as pd
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session
-from app.core.database import get_db, SessionLocal
-from app.core.security import require_admin
+
 from app import schemas
+from app.core.database import SessionLocal, get_db
+from app.core.security import require_admin
 from app.services import crud
 from app.services import day_planning_service as day_svc
 from app.services import schedule_service as sched_svc
-from io import BytesIO
-import pandas as pd
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 logger = logging.getLogger(__name__)
@@ -141,7 +143,7 @@ def admin_bulk_update_strict(day_id: int, req: schemas.BulkUpdateStrictRequest, 
 )
 def admin_generate_semester(request: schemas.GenerateScheduleRequest, background: BackgroundTasks):
     # Inline-duplicate logic to avoid tight coupling to public router
-    from app.api.routers.schedule import _generation_jobs, _background_generate_semester
+    from app.api.routers.schedule import _background_generate_semester, _generation_jobs
     try:
         async_mode = True if request.async_mode is None else bool(request.async_mode)
         if async_mode:

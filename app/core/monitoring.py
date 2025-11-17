@@ -2,13 +2,14 @@
 Monitoring and metrics collection for the application.
 Provides Prometheus-compatible metrics and performance tracking.
 """
-import time
 import logging
-from typing import Callable
-from fastapi import Request, Response
-from starlette.middleware.base import BaseHTTPMiddleware
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+import time
 from collections import defaultdict
+from typing import Callable
+
+from fastapi import Request, Response
+from prometheus_client import Counter, Gauge, Histogram, generate_latest
+from starlette.middleware.base import BaseHTTPMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +156,7 @@ class MetricsMiddleware(BaseHTTPMiddleware):
                 )
 
             return response
-        except Exception as e:
+        except Exception:
             duration = time.time() - start_time
             REQUEST_COUNT.labels(
                 method=request.method,

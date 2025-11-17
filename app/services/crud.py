@@ -1,16 +1,17 @@
-from typing import List, Set, Dict, Optional
-from sqlalchemy.orm import Session
-from sqlalchemy import and_
-from app import models
-from app import schemas
-from app.schemas import WeekType
-from datetime import date, timedelta
-import math
-import pandas as pd
-from collections import defaultdict
-import random
 import logging
+import math
+import random
+from collections import defaultdict
+from datetime import date, timedelta
+from typing import Dict, List, Optional, Set
+
+import pandas as pd
+from sqlalchemy import and_
+from sqlalchemy.orm import Session
+
+from app import models, schemas
 from app.core.config import settings
+from app.schemas import WeekType
 
 logger = logging.getLogger(__name__)
 
@@ -829,7 +830,7 @@ def get_vacant_slots_for_teacher(db: Session, teacher_name: str, week_start: dat
         raise ValueError("Teacher not found")
     occ = _occupied_slots_for_teacher_week(db, teacher.id, week_start)
     result = []
-    for i, dname in enumerate(days):
+    for _i, dname in enumerate(days):
         # use both shifts time slots conservatively
         all_slots = {s["start"]: s for s in (SHIFT1_SLOTS + SHIFT2_SLOTS)}
         for start, slot in all_slots.items():
@@ -1968,7 +1969,7 @@ def analyze_day_schedule(db: Session, day_schedule_id: int, group_name: str | No
         ordered_entries = sorted([e for e in entries if e.start_time in order], key=lambda e: order[e.start_time])
         windows = 0
         duplicates = 0
-        for (gk, st), ent in group_slots.items():
+        for (gk, _st), ent in group_slots.items():
             if gk == gid and len(ent) > 1:
                 duplicates += 1
         for i in range(1, len(ordered_entries)):

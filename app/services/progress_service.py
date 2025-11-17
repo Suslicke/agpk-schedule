@@ -3,7 +3,9 @@
 Thin wrappers around legacy functions in app.services.crud.
 """
 from typing import List
+
 from sqlalchemy.orm import Session
+
 from app import schemas
 from app.services import crud
 

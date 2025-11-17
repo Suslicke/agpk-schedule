@@ -3,23 +3,23 @@
 Progressively moving implementations here from the legacy crud module.
 Routers should use this layer instead of app.services.crud.
 """
-from typing import Optional, List, Dict
-from datetime import date
-from sqlalchemy.orm import Session
-
 import logging
 import random
-import math
 from collections import defaultdict
-from app import schemas, models
+from datetime import date
+from typing import Dict, List, Optional
+
+from sqlalchemy.orm import Session
+
+from app import models, schemas
 from app.services import crud
 from app.services.helpers import (
+    PAIR_SIZE_AH,
+    _get_time_slots_for_group,
+    _get_week_start,
     _room_has_capacity,
     _teacher_is_free,
-    _get_week_start,
-    _get_time_slots_for_group,
     days,
-    PAIR_SIZE_AH,
 )
 
 logger = logging.getLogger(__name__)
@@ -109,7 +109,7 @@ def get_entry_replacement_options(db: Session, entry_id: int, *, limit_teachers:
             "source": source,
             "busy": True,
             "conflicts_count": len(conflicts),
-            "busy_groups": sorted(list(busy_groups)),
+            "busy_groups": sorted(busy_groups),
             "conflicts": conflict_details,
         })
         seen_teachers.add(t.id)
@@ -463,7 +463,7 @@ def propose_teacher_swap(db: Session, entry_id: int, desired_teacher_name: str, 
         t = db.query(models.Teacher).get(c.teacher_id) if c.teacher_id else None
         # Build alternatives: prefer mapping for (group, subject), then group-any, then any free
         alt_teachers: list[str] = []
-        seen: set[int] = set([teacher.id])  # don't suggest the desired teacher back
+        seen: set[int] = {teacher.id}  # don't suggest the desired teacher back
         # 1) Group-Subject mapping
         mapped_same = (
             db.query(models.GroupTeacherSubject)
@@ -927,7 +927,7 @@ def analyze_day_schedule(db: Session, day_schedule_id: int, group_name: str | No
         ordered_entries = sorted([e for e in entries if e.start_time in order], key=lambda e: order[e.start_time])
         windows = 0
         duplicates = 0
-        for (gk, st), ent in group_slots.items():
+        for (gk, _st), ent in group_slots.items():
             if gk == gid and len(ent) > 1:
                 duplicates += 1
         for i in range(1, len(ordered_entries)):
@@ -1598,7 +1598,7 @@ def autofill_day_min_pairs(db: Session, req: schemas.AutofillDayRequest) -> sche
     # Build items with weekly hours for this week
     from collections import defaultdict as _dd
     items_by_group: dict[int, list[models.ScheduleItem]] = {}
-    is_even_week = (_get_week_start(req.date).isocalendar().week % 2 == 0)
+    (_get_week_start(req.date).isocalendar().week % 2 == 0)
     for gid in target_group_ids:
         items_by_group[gid] = []
     q = db.query(models.WeeklyDistribution).join(models.ScheduleItem).filter(models.WeeklyDistribution.week_start == _get_week_start(req.date))
