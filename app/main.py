@@ -5,7 +5,7 @@ from app.api.routers import admin, analytics, dictionary, export, practice, prog
 from app.core.config import settings
 from app.core.database import init_db
 from app.core.logging_config import RequestIdMiddleware, setup_logging
-from app.core.monitoring import CONTENT_TYPE_LATEST, MetricsMiddleware, get_dashboard_stats, get_metrics
+from app.core.monitoring import MetricsMiddleware, get_dashboard_stats, get_metrics
 
 setup_logging(
     level=settings.log_level,
@@ -65,7 +65,7 @@ async def health():
 @app.get("/metrics")
 async def metrics():
     """Prometheus metrics endpoint."""
-    return Response(content=get_metrics(), media_type=CONTENT_TYPE_LATEST)
+    return Response(content=get_metrics())
 
 
 @app.get("/stats")
