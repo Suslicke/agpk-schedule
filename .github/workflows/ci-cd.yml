@@ -1,113 +1,206 @@
-name: Simple Deploy
+name: CI/CD Pipeline
 
-# Когда запускается: при push в ветку main
 on:
   push:
+    branches: [ main, develop ]
+  pull_request:
     branches: [ main ]
 
+env:
+  PYTHON_VERSION: '3.10'
+
 jobs:
-  # Единственная задача: загрузить код на сервер и запустить
-  deploy:
-    name: 🚀 Deploy to Server
+  # lint:
+  #   name: Lint & Format Check
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+
+  #     - name: Set up Python
+  #       uses: actions/setup-python@v5
+  #       with:
+  #         python-version: ${{ env.PYTHON_VERSION }}
+
+  #     - name: Cache pip packages
+  #       uses: actions/cache@v3
+  #       with:
+  #         path: ~/.cache/pip
+  #         key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+  #         restore-keys: |
+  #           ${{ runner.os }}-pip-
+
+  #     - name: Install dependencies
+  #       run: |
+  #         python -m pip install --upgrade pip
+  #         pip install ruff black isort mypy
+
+  #     - name: Run Ruff (linter)
+  #       run: |
+  #         ruff check app/ --output-format=github
+  #       continue-on-error: true
+
+  #     - name: Run Black (formatter check)
+  #       run: |
+  #         black --check app/
+
+  #     - name: Run isort (import sorting check)
+  #       run: |
+  #         isort --check-only app/
+
+  #     - name: Run MyPy (type checking)
+  #       run: |
+  #         mypy app/ --ignore-missing-imports
+  #       continue-on-error: true
+
+  # security:
+  #   name: Security Scan
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+
+  #     - name: Set up Python
+  #       uses: actions/setup-python@v5
+  #       with:
+  #         python-version: ${{ env.PYTHON_VERSION }}
+
+  #     - name: Install dependencies
+  #       run: |
+  #         python -m pip install --upgrade pip
+  #         pip install bandit safety
+
+  #     - name: Run Bandit (security linter)
+  #       run: |
+  #         bandit -r app/ -f json -o bandit-report.json
+  #       continue-on-error: true
+
+  #     - name: Run Safety (dependency vulnerability check)
+  #       run: |
+  #         safety check --json
+  #       continue-on-error: true
+
+  #     - name: Upload security reports
+  #       uses: actions/upload-artifact@v3
+  #       if: always()
+  #       with:
+  #         name: security-reports
+  #         path: |
+  #           bandit-report.json
+
+  # test:
+  #   name: Run Tests
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+
+  #     - name: Set up Python
+  #       uses: actions/setup-python@v5
+  #       with:
+  #         python-version: ${{ env.PYTHON_VERSION }}
+
+  #     - name: Install dependencies
+  #       run: |
+  #         python -m pip install --upgrade pip
+  #         pip install -r requirements.txt
+
+  #     - name: Run tests
+  #       run: |
+  #         pytest
+
+  build:
+    name: Build Docker Image
     runs-on: ubuntu-latest
+    # needs: [lint, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
-      # ШАГ 1: Получаем код из репозитория
-      - name: 📥 Checkout code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      # ШАГ 2: Настраиваем SSH для подключения к серверу
-      - name: 🔐 Setup SSH
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
         run: |
-          # Создаем папку для SSH ключей
+          docker build -t schedule-api:${{ github.sha }} .
+          docker tag schedule-api:${{ github.sha }} schedule-api:latest
+
+      - name: Export Docker image as tarball
+        run: |
+          docker save schedule-api:latest -o schedule-api.tar
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: schedule-api.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy to Server
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: ${{ vars.SERVER_URL }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: docker-image
+          path: .
+
+      - name: Setup SSH
+        run: |
           mkdir -p ~/.ssh
-
-          # Сохраняем приватный ключ из секретов GitHub
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
-
-          # Устанавливаем правильные права (обязательно!)
           chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.SERVER_HOST }}" >> ~/.ssh/known_hosts
 
-          # Добавляем сервер в известные хосты (чтобы не было вопросов при подключении)
-          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
-
-      # ШАГ 3: Копируем файлы на сервер
-      - name: 📤 Copy files to server
+      - name: Copy files to server
         run: |
-          # Используем rsync для копирования всех файлов проекта
-          # Исключаем ненужное (.git, .github, __pycache__, и т.д.)
-          rsync -avz --delete \
-            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='__pycache__' \
-            --exclude='*.pyc' \
-            --exclude='.env' \
-            --exclude='venv' \
-            --exclude='.venv' \
-            --exclude='logs/' \
-            ./ ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:${{ secrets.DEPLOY_PATH }}/
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            schedule-api.tar \
+            docker-compose.yml \
+            "${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:${{ secrets.DEPLOY_PATH }}/"
 
-      # ШАГ 4: Запускаем на сервере
-      - name: 🐳 Run docker-compose
+      - name: Deploy on server
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
-            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'ENDSSH'
+            "${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}" << EOF
+          set -e
 
-          # Переходим в папку проекта
-          cd ${{ secrets.DEPLOY_PATH }}
+          cd "${{ secrets.DEPLOY_PATH }}"
 
-          # Останавливаем старые контейнеры (если есть)
-          docker-compose down || true
+          docker load -i schedule-api.tar
+          docker compose run --rm api alembic upgrade head || echo "No migrations step configured"
+          docker compose up -d api
+          docker image prune -f
 
-          # Применяем миграции базы данных
-          docker-compose run --rm web alembic upgrade head
-
-          # Запускаем все сервисы в фоне
-          docker-compose up -d --build
-
-          # Даем время на запуск (5 секунд)
-          echo "⏳ Waiting for services to start..."
           sleep 5
+          curl -f http://localhost:8000/health || exit 1
 
-          # Показываем статус контейнеров
-          echo "📊 Container status:"
-          docker-compose ps
+          echo "Deployment successful!"
+          EOF
 
-          ENDSSH
-
-      # ШАГ 5: Проверяем что всё работает
-      - name: ✅ Health check
-        run: |
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
-            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'ENDSSH'
-
-          cd ${{ secrets.DEPLOY_PATH }}
-
-          # Проверяем health endpoint
-          echo "🏥 Checking health..."
-          if curl -f http://localhost:8000/health; then
-            echo "✅ Application is healthy!"
-          else
-            echo "❌ Health check failed!"
-            echo "📋 Container logs:"
-            docker-compose logs --tail=50 web
-            exit 1
-          fi
-
-          ENDSSH
-
-      # ШАГ 6: Очистка (удаляем SSH ключ)
-      - name: 🧹 Cleanup
+      - name: Cleanup local SSH key
         if: always()
         run: |
           rm -f ~/.ssh/deploy_key
 
-      # ШАГ 7: Финальное сообщение
-      - name: 🎉 Success
-        if: success()
+      - name: Notify deployment status
+        if: always()
         run: |
-          echo "================================"
-          echo "✅ Deployment successful!"
-          echo "🌐 Application URL: ${{ secrets.SERVER_URL }}"
-          echo "================================"
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ Deployment successful!"
+          else
+            echo "❌ Deployment failed!"
+          fi
