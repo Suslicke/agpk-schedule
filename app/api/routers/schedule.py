@@ -1,14 +1,15 @@
 import logging
 import uuid
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app import schemas
+from app import models, schemas
 from app.core.database import SessionLocal, get_db
 from app.core.security import require_admin
+from app.services import crud
 from app.services import day_planning_service as day_svc
 from app.services import schedule_service as sched_svc
 
@@ -73,20 +74,23 @@ def query_schedule(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-_generation_jobs: dict[str, dict] = {}
-
-
 def _background_generate_semester(job_id: str, request: schemas.GenerateScheduleRequest):
     logger.info("[GEN %s] Background semester generation started: %s -> %s, semester=%s, group=%s", job_id, request.start_date, request.end_date, request.semester, request.group_name or "ALL")
     db = SessionLocal()
     try:
-        gens = sched_svc.generate_schedule(db, request)
-        resp = [sched_svc.get_generated_schedule(db, g.id) for g in gens]
-        _generation_jobs[job_id] = {"status": "done", "result": resp}
-        logger.info("[GEN %s] Done. Generated %d schedules", job_id, len(resp))
+        gens = sched_svc.generate_schedule(db, request, job_id=job_id)
+        logger.info("[GEN %s] Done. Generated %d schedules", job_id, len(gens))
     except Exception as e:
-        _generation_jobs[job_id] = {"status": "error", "error": str(e)}
-        logger.warning("[GEN %s] Failed: %s", job_id, e)
+        logger.exception("[GEN %s] Failed: %s", job_id, e)
+        # Mark schedules as failed in DB
+        from app import models
+        failed_schedules = db.query(models.GeneratedSchedule).filter(models.GeneratedSchedule.job_id == job_id).all()
+        for gs in failed_schedules:
+            gs.status = "failed"
+            gs.error_message = str(e)
+            gs.completed_at = datetime.now()
+            db.add(gs)
+        db.commit()
     finally:
         db.close()
 
@@ -96,21 +100,18 @@ def _background_generate_semester(job_id: str, request: schemas.GenerateSchedule
     summary="Generate schedules for a semester (background by default)",
     tags=["schedule"],
 )
-def generate_semester_endpoint(request: schemas.GenerateScheduleRequest, background: BackgroundTasks, _: bool = Depends(require_admin)):
+def generate_semester_endpoint(request: schemas.GenerateScheduleRequest, background: BackgroundTasks, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
     try:
         async_mode = True if request.async_mode is None else bool(request.async_mode)
         if async_mode:
             job_id = str(uuid.uuid4())
-            _generation_jobs[job_id] = {"status": "pending"}
             background.add_task(_background_generate_semester, job_id, request)
             logger.info("Generate semester accepted, job_id=%s", job_id)
-            return {"job_id": job_id, "status": "accepted"}
+            return {"job_id": job_id, "status": "accepted", "message": "Generation started in background. Use GET /schedule/generate_semester/status/{job_id} to check progress."}
         # sync mode
         logger.info("Generate semester (sync): %s -> %s, semester=%s, group=%s", request.start_date, request.end_date, request.semester, request.group_name or "ALL")
-        db = SessionLocal()
         gens = sched_svc.generate_schedule(db, request)
         resp = [sched_svc.get_generated_schedule(db, g.id) for g in gens]
-        db.close()
         logger.info("Generated %d schedules", len(resp))
         return resp
     except ValueError as e:
@@ -120,14 +121,54 @@ def generate_semester_endpoint(request: schemas.GenerateScheduleRequest, backgro
 
 @router.get(
     "/generate_semester/status/{job_id}",
-    summary="Get background semester generation status",
+    summary="Get background semester generation status with statistics",
     tags=["schedule"],
 )
-def generate_semester_status(job_id: str):
-    job = _generation_jobs.get(job_id)
-    if not job:
+def generate_semester_status(job_id: str, db: Session = Depends(get_db)):
+    # Query all schedules for this job
+    schedules = db.query(models.GeneratedSchedule).filter(models.GeneratedSchedule.job_id == job_id).all()
+
+    if not schedules:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job
+
+    # Aggregate status
+    statuses = [s.status for s in schedules]
+    if all(s == "completed" for s in statuses):
+        overall_status = "completed"
+    elif any(s == "failed" for s in statuses):
+        overall_status = "failed"
+    elif any(s == "in_progress" for s in statuses):
+        overall_status = "in_progress"
+    else:
+        overall_status = "pending"
+
+    # Collect results
+    results: List[schemas.GeneratedScheduleResponse] = []
+    for s in schedules:
+        results.append(sched_svc.get_generated_schedule(db, s.id))
+
+    # Aggregate statistics
+    total_stats = {
+        "total_pairs": 0,
+        "total_hours_assigned": 0.0,
+        "warnings_count": 0,
+        "hours_exceeded_count": 0,
+        "groups": len(schedules)
+    }
+
+    for s in schedules:
+        if s.stats:
+            total_stats["total_pairs"] += s.stats.get("total_pairs", 0)
+            total_stats["total_hours_assigned"] += s.stats.get("total_hours_assigned", 0.0)
+            total_stats["warnings_count"] += s.stats.get("warnings_count", 0)
+            total_stats["hours_exceeded_count"] += s.stats.get("hours_exceeded_count", 0)
+
+    return {
+        "job_id": job_id,
+        "status": overall_status,
+        "total_statistics": total_stats,
+        "schedules": results
+    }
 
 
 

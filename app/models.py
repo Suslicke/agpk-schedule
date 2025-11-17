@@ -1,6 +1,7 @@
+from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import JSON, Column, Date, Float, ForeignKey, Integer, String
+from sqlalchemy import JSON, Column, Date, DateTime, Float, ForeignKey, Integer, String
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -71,7 +72,17 @@ class GeneratedSchedule(Base):
     end_date = Column(Date, nullable=False)
     semester = Column(String, nullable=False)
     group_id = Column(Integer, ForeignKey("groups.id"), nullable=False, index=True)
-    status = Column(String, default="pending", nullable=False)
+    status = Column(String, default="pending", nullable=False)  # pending | in_progress | completed | failed
+    # Job tracking for async generation
+    job_id = Column(String, nullable=True, index=True)
+    # Statistics about the generation (JSON: {total_pairs, warnings, hours_exceeded, etc.})
+    stats = Column(JSON, nullable=True)
+    # Error message if generation failed
+    error_message = Column(String, nullable=True)
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
     group = relationship("Group")
     weekly_distributions = relationship(
         "WeeklyDistribution",

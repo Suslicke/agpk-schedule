@@ -31,13 +31,21 @@ Core endpoints
       - `origin`: `day_plan | weekly`
       - `approval_status`: `approved | replaced_manual | replaced_auto | planned | pending`
       - `is_override`: `true|false` — слот из дневного плана перекрывает недельный
+      - `is_even_week`: `true|false` — четность недели (true = четная, false = нечетная)
       - `day_id`, `entry_id` (если из дневного плана)
     - Примечание: для дат, на которые есть дневной план, в выдаче приоритет у утверждённых и вручную заменённых пар из дневного плана; слоты недельного плана на эти же (date, group, time) скрываются.
 
 - Day plan
   - `POST /admin/schedule/generate_semester` — generate schedules for a semester (async by default). Requires `X-Admin-Token`.
-    - **Новое поведение**: При создании недельного плана система гарантирует **минимум 3 пары для каждой группы в день**, начиная **с первого урока** соответствующей смены.
-    - **Практика**: Группы на практике автоматически исключаются из создания расписания.
+    - **Асинхронная генерация**: Возвращает `job_id` для отслеживания прогресса через `/schedule/generate_semester/status/{job_id}`
+    - **Статистика**: После завершения доступна детальная статистика:
+      - Общее количество созданных пар
+      - Назначенные часы
+      - Предупреждения (warnings) - где не удалось назначить все часы
+      - Превышения часов (hours_exceeded) - где создано больше пар чем планировалось
+    - **Генерация всегда продолжается**: Даже при превышении часов план создаётся полностью, информация о превышениях сохраняется в статистике
+    - **Минимум 3 пары в день**: Система гарантирует **минимум 3 пары для каждой группы в день**, начиная **с первого урока** соответствующей смены
+    - **Практика**: Группы на практике автоматически исключаются из создания расписания
   - `POST /schedule/day/plan` — (protected) create plan for a date; by default for ALL groups (omit `group_name`). Requires `X-Admin-Token`.
     - Optional: `auto_vacant_remove: true` — automatically replace vacant/unknown teachers with available ones using group-teacher-subject mappings.
     - **Новое поведение**: При создании расписания с нуля (from_plan=false) система гарантирует **минимум 3 пары для каждой группы**, начиная **с первого урока** смены.
@@ -82,15 +90,14 @@ Notes
 
 Hours and parity
 
-- Excel fields `часы` and `количество часов в неделю` are treated as academic hours (45‑minute units).
+- Excel fields `часы` and `количество часов в неделю` are treated as **semester** academic hours (45‑minute units).
 - One scheduled lesson slot (pair) equals 2 academic hours (2×45=90 minutes) by default.
 - Weekly distribution for odd cases follows parity priority:
   - 5 weekly hours with `правая` (even_priority) → 3 pairs on even weeks, 2 pairs on odd weeks.
   - 1 weekly hour with `левая` (odd_priority) → 1 pair on odd weeks, 0 on even weeks.
-- New config knobs:
-  - `.env`: `PAIR_SIZE_ACADEMIC_HOURS` (default 2), `PARITY_BASE_DATE` (default 2025‑09‑01), `TOTAL_HOURS_IS_ANNUAL` (default false).
+- Config knobs:
+  - `.env`: `PAIR_SIZE_ACADEMIC_HOURS` (default 2), `PARITY_BASE_DATE` (default 2025‑09‑01).
   - Request overrides in `POST /schedule/generate_semester` body:
-    - `total_hours_is_annual?: bool` — if true, Excel totals are annual, halve for semester.
     - `parity_base_date?: YYYY-MM-DD` — base date to compute even/odd weeks.
     - `pair_size_academic_hours?: int` — size of one pair in academic hours.
 

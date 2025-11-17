@@ -2,7 +2,7 @@ import logging
 import math
 import random
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Set
 
 import pandas as pd
@@ -357,7 +357,7 @@ def _assign_daily_schedule(
     return daily_schedule
 
 
-def create_schedules(db: Session, request: schemas.GenerateScheduleRequest):
+def create_schedules(db: Session, request: schemas.GenerateScheduleRequest, job_id: str | None = None):
     if request.group_name:
         groups = db.query(models.Group).filter(models.Group.name == request.group_name).all()
     else:
@@ -371,7 +371,9 @@ def create_schedules(db: Session, request: schemas.GenerateScheduleRequest):
             end_date=request.end_date,
             semester=request.semester,
             group_id=group.id,
-            status="pending"
+            status="pending",
+            job_id=job_id,
+            created_at=datetime.now()
         )
         db.add(gen_sched)
         db.commit()
@@ -422,9 +424,8 @@ def fill_schedules(db: Session, gen_schedules: List[models.GeneratedSchedule], r
         logger.warning("No schedule items found for provided request")
         return
 
-    # Effective total hours (in academic hours). If Excel totals are annual, halve for semester.
-    divisor = 2 if (request.total_hours_is_annual if request.total_hours_is_annual is not None else settings.total_hours_is_annual) else 1
-    remaining_hours = {item.id: (item.total_hours / divisor) for item in all_items}
+    # Effective total hours (in academic hours). Hours from Excel are per semester.
+    remaining_hours = {item.id: item.total_hours for item in all_items}
     room_occupancy = defaultdict(int)
     occupied_teacher = set()
     occupied_group = set()
@@ -471,8 +472,6 @@ def fill_schedules(db: Session, gen_schedules: List[models.GeneratedSchedule], r
         distributions = []
         logger.info("Planning week %s..%s (even=%s)", current_date, week_end, is_even)
         for item in all_items:
-            if remaining_hours[item.id] <= 0:
-                continue
             # Check if group is on practice during this week - skip if so
             # We need to check each day in the week for practice
             week_has_practice = False
@@ -490,15 +489,10 @@ def fill_schedules(db: Session, gen_schedules: List[models.GeneratedSchedule], r
 
             # Pair size may be overridden per request
             pair_size_ah = request.pair_size_academic_hours or PAIR_SIZE_AH
-            weekly_ah = min(item.weekly_hours, remaining_hours[item.id])
+            # Always use weekly hours - don't limit by remaining to allow generation even when exceeded
+            weekly_ah = item.weekly_hours
             hours = _distribute_hours(weekly_ah, item.week_type, is_even, pair_size_ah)
-            # Clamp to remaining (align to full pairs)
-            if hours > remaining_hours[item.id]:
-                # Reduce to the largest multiple of pair_size_ah not exceeding remaining
-                max_pairs = int(remaining_hours[item.id] // pair_size_ah)
-                hours = float(max_pairs * pair_size_ah)
-                if hours <= 0:
-                    continue
+            # Note: We continue generation even if hours are exceeded to create a complete plan
             logger.debug(
                 "Item id=%s group=%s subject=%s weekly=%.2f -> hours_this_week=%.2f remaining_before=%.2f",
                 item.id,
@@ -545,15 +539,75 @@ def fill_schedules(db: Session, gen_schedules: List[models.GeneratedSchedule], r
         db.commit()
         logger.info("Saved %d distributions for week %s", len(distributions), current_date)
         current_date = week_end + timedelta(days=1)
+
+    # Collect statistics for each generated schedule
     for gen_sched in gen_schedules:
         gen_sched.status = "completed"
+        gen_sched.completed_at = datetime.now()
+
+        # Calculate statistics
+        total_pairs = 0
+        total_hours_assigned = 0.0
+        warnings = []
+        hours_exceeded = []
+
+        # Get all distributions for this schedule
+        dists = db.query(models.WeeklyDistribution).filter(
+            models.WeeklyDistribution.generated_schedule_id == gen_sched.id
+        ).all()
+
+        for dist in dists:
+            pairs_count = len(dist.daily_schedule or [])
+            total_pairs += pairs_count
+            total_hours_assigned += pairs_count * PAIR_SIZE_AH
+
+        # Check for hours exceeded (negative remaining hours)
+        group_items = db.query(models.ScheduleItem).filter(
+            models.ScheduleItem.group_id == gen_sched.group_id
+        ).all()
+
+        for item in group_items:
+            remaining = remaining_hours.get(item.id, 0)
+            if remaining < 0:
+                hours_exceeded.append({
+                    "group": item.group.name,
+                    "subject": item.subject.name,
+                    "teacher": item.teacher.name,
+                    "total_hours": item.total_hours,
+                    "assigned_hours": item.total_hours - remaining,
+                    "exceeded_by": abs(remaining)
+                })
+                logger.warning(
+                    "HOURS EXCEEDED: %s / %s / %s - exceeded by %.1f hours",
+                    item.group.name, item.subject.name, item.teacher.name, abs(remaining)
+                )
+            elif remaining > PAIR_SIZE_AH:  # More than one pair remaining
+                warnings.append({
+                    "group": item.group.name,
+                    "subject": item.subject.name,
+                    "teacher": item.teacher.name,
+                    "remaining_hours": remaining,
+                    "message": f"Could not assign all hours (remaining: {remaining} hours)"
+                })
+
+        # Store statistics
+        gen_sched.stats = {
+            "total_pairs": total_pairs,
+            "total_hours_assigned": total_hours_assigned,
+            "warnings_count": len(warnings),
+            "hours_exceeded_count": len(hours_exceeded),
+            "warnings": warnings,
+            "hours_exceeded": hours_exceeded
+        }
+
         db.add(gen_sched)
+
     db.commit()
     logger.info("Finished filling schedules: %d schedules marked completed", len(gen_schedules))
 
 
-def generate_schedule(db: Session, request: schemas.GenerateScheduleRequest):
-    gen_schedules = create_schedules(db, request)
+def generate_schedule(db: Session, request: schemas.GenerateScheduleRequest, job_id: str | None = None):
+    gen_schedules = create_schedules(db, request, job_id=job_id)
     fill_schedules(db, gen_schedules, request)
     return gen_schedules
 
@@ -2348,6 +2402,19 @@ def progress_summary(db: Session, group_name: str | None = None, subject_name: s
     return result
 
 
+# Helper function to compute week parity
+def _compute_week_parity(target_date: date, parity_base_date: str | None = None) -> bool:
+    """Compute if the target date falls on an even week (True) or odd week (False)."""
+    base_str = parity_base_date or settings.parity_base_date or "2025-09-01"
+    try:
+        base_y, base_m, base_d = [int(x) for x in base_str.split('-')]
+        base = date(base_y, base_m, base_d)
+    except Exception:
+        base = date(2025, 9, 1)
+    week_number = (target_date - base).days // 7
+    return (week_number % 2 == 0)
+
+
 # ---- Generic schedule query (date / range, filters) ----
 def query_schedule(
     db: Session,
@@ -2445,6 +2512,8 @@ def query_schedule(
             room_name_out = ""
             if r and not _is_placeholder_room_name(r.name):
                 room_name_out = r.name
+            # Compute week parity for this date
+            is_even = _compute_week_parity(ds.date)
             items.append(
                 schemas.ScheduleQueryEntry(
                     date=ds.date,
@@ -2460,6 +2529,7 @@ def query_schedule(
                     is_override=True,
                     day_id=ds.id,
                     entry_id=e.id,
+                    is_even_week=is_even,
                 )
             )
 
@@ -2503,6 +2573,8 @@ def query_schedule(
             # Skip if overridden by an approved day plan/manual replacement
             if (slot_date, item.group_id, slot["start_time"]) in overrides_index:
                 continue
+            # Use the week parity from the distribution
+            is_even = bool(d.is_even_week)
             items.append(
                 schemas.ScheduleQueryEntry(
                     date=slot_date,
@@ -2518,6 +2590,7 @@ def query_schedule(
                     is_override=False,
                     day_id=None,
                     entry_id=None,
+                    is_even_week=is_even,
                 )
             )
 

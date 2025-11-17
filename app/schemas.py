@@ -5,9 +5,9 @@ try:
     from pydantic import AliasChoices
 except Exception:
     AliasChoices = None  # type: ignore
-from datetime import date
+from datetime import date, datetime
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 class WeekType(str, Enum):
@@ -64,9 +64,6 @@ class GenerateScheduleRequest(BaseModel):
     enable_shifts: Optional[bool] = True
     # If true (default), run generation in background and return job id immediately
     async_mode: Optional[bool] = True
-    # Optional overrides for generation semantics (fallback to settings if not provided)
-    # If True, treats imported total_hours as annual and halves them for this run
-    total_hours_is_annual: Optional[bool] = None
     # Override base date to compute even/odd weeks (YYYY-MM-DD)
     parity_base_date: Optional[date] = None
     # Override pair size in academic hours for this run (default from settings)
@@ -114,6 +111,11 @@ class GeneratedScheduleResponse(BaseModel):
     end_date: date
     semester: str
     status: str
+    job_id: Optional[str] = None
+    stats: Optional[Dict] = None  # Statistics: total_pairs, warnings, hours_exceeded, etc.
+    error_message: Optional[str] = None
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
     weekly_distributions: List[WeeklyDistributionResponse]
 
     class Config:
@@ -411,6 +413,8 @@ class ScheduleQueryEntry(BaseModel):
     is_override: bool = False
     day_id: Optional[int] = None
     entry_id: Optional[int] = None
+    # week parity information
+    is_even_week: Optional[bool] = None  # True for even weeks, False for odd weeks
 
 
 class ScheduleQueryResponse(BaseModel):
