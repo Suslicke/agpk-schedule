@@ -132,7 +132,6 @@ def get_primary_teacher(schedule_item: models.ScheduleItem) -> models.Teacher:
 def create_schedule_item(db: Session, item: schemas.ScheduleItemCreate):
     group = get_or_create_group(db, item.group_name)
     subject = get_or_create_subject(db, item.subject_name)
-    room = get_or_create_room(db, item.room_name)
 
     # Split teachers by "/" - support multiple teachers per subject
     teacher_names = [t.strip() for t in item.teacher_name.split('/') if t.strip()]
@@ -142,6 +141,12 @@ def create_schedule_item(db: Session, item: schemas.ScheduleItemCreate):
         teachers = [get_or_create_teacher(db, 'Unknown')]
 
     primary_teacher = teachers[0]
+
+    # Room: keep full name (may contain "/" for multiple rooms like "ГК101/МК132")
+    # We create/get Room with the FULL name to preserve the original string
+    room = get_or_create_room(db, item.room_name)
+    # Count room slots by number of "/" + 1
+    room_count = item.room_name.count('/') + 1 if item.room_name else 1
 
     existing = db.query(models.ScheduleItem).filter(
         and_(
@@ -166,7 +171,8 @@ def create_schedule_item(db: Session, item: schemas.ScheduleItemCreate):
         total_hours=item.total_hours,
         weekly_hours=item.weekly_hours,
         week_type=item.week_type,
-        teacher_slots=len(teachers)  # Number of teacher slots needed
+        teacher_slots=len(teachers),  # Number of teacher slots needed
+        room_slots=room_count  # Number of room slots needed
     )
     db.add(schedule_item)
     db.flush()  # Get ID before creating associations
@@ -1470,6 +1476,7 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
                     end_time=slot["end_time"],
                     status="pending",
                     schedule_item_id=item.id,
+                    room_slots=item.room_slots if hasattr(item, 'room_slots') else 1,
                 )
                 db.add(entry)
                 db.flush()  # Get entry.id
@@ -1521,12 +1528,20 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
                     else:
                         # gap encountered -> stop to ensure consecutive block
                         break
-                # Apply cap if needed
+                # Apply cap if needed, BUT respect weekly plan if flag is set
+                # If respect_weekly_plan=True (default), preserve ALL pairs from weekly plan even if > cap
                 if cap and len(keep_seq) > cap:
-                    keep_seq = keep_seq[:cap]
-                    _last_plan_debug.setdefault(ds.id, []).append(
-                        f"Группа {group.name}: ограничено {cap} парами (max_pairs_per_day)"
-                    )
+                    if not bool(request.respect_weekly_plan):
+                        # Only limit if NOT respecting weekly plan
+                        keep_seq = keep_seq[:cap]
+                        _last_plan_debug.setdefault(ds.id, []).append(
+                            f"Группа {group.name}: ограничено {cap} парами (max_pairs_per_day)"
+                        )
+                    else:
+                        # Respecting weekly plan - keep all pairs
+                        _last_plan_debug.setdefault(ds.id, []).append(
+                            f"Группа {group.name}: сохранено {len(keep_seq)} пар из недельного плана (respect_weekly_plan=True)"
+                        )
                 keep_ids = {e.id for e in keep_seq}
                 # Delete others with detailed reasons
                 removed = 0
@@ -1712,6 +1727,7 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
                     end_time=end,
                     status="pending",
                     schedule_item_id=picked_item.id,
+                    room_slots=picked_item.room_slots if hasattr(picked_item, 'room_slots') else 1,
                 )
                 db.add(e)
                 db.flush()  # Get entry.id
@@ -2891,6 +2907,11 @@ def query_schedule(
             room_name_out = ""
             if r and not _is_placeholder_room_name(r.name):
                 room_name_out = r.name
+            # Get all teachers for this entry (supports multiple teachers)
+            entry_teachers = get_day_entry_teachers(db, e)
+            teacher_names_list = [t.name for t in entry_teachers]
+            teacher_name_str = "/".join(teacher_names_list) if teacher_names_list else ""
+
             # Compute week parity for this date
             is_even = _compute_week_parity(ds.date)
             items.append(
@@ -2900,7 +2921,8 @@ def query_schedule(
                     start_time=e.start_time,
                     end_time=e.end_time,
                     subject_name=s.name if s else str(e.subject_id),
-                    teacher_name=(t.name if t else ""),
+                    teacher_name=teacher_name_str,
+                    teacher_names=teacher_names_list if len(teacher_names_list) > 1 else None,  # Only if multiple
                     room_name=room_name_out,
                     group_name=g.name if g else str(e.group_id),
                     origin="day_plan",
@@ -2952,6 +2974,12 @@ def query_schedule(
             # Skip if overridden by an approved day plan/manual replacement
             if (slot_date, item.group_id, slot["start_time"]) in overrides_index:
                 continue
+
+            # Get all teachers for this item (supports multiple teachers)
+            item_teachers = get_schedule_item_teachers(item)
+            teacher_names_list = [t.name for t in item_teachers]
+            teacher_name_str = "/".join(teacher_names_list) if teacher_names_list else ""
+
             # Use the week parity from the distribution
             is_even = bool(d.is_even_week)
             items.append(
@@ -2961,7 +2989,8 @@ def query_schedule(
                     start_time=slot["start_time"],
                     end_time=slot["end_time"],
                     subject_name=item.subject.name,
-                    teacher_name=item.teacher.name,
+                    teacher_name=teacher_name_str,
+                    teacher_names=teacher_names_list if len(teacher_names_list) > 1 else None,  # Only if multiple
                     room_name=item.room.name,
                     group_name=item.group.name,
                     origin="weekly",

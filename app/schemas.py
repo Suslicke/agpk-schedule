@@ -207,6 +207,9 @@ class DayPlanCreateRequest(BaseModel):
     ignore_weekly_conflicts: Optional[bool] = True
     # If True, clears existing entries before creating new ones (default False to preserve existing entries)
     clear_existing: Optional[bool] = False
+    # If True, preserves ALL pairs from weekly plan even if > max_pairs (default True)
+    # When False, allows removing pairs from weekly plan to fit max_pairs
+    respect_weekly_plan: Optional[bool] = True
     # Toggles for building a day plan (mostly affects from_plan=false)
     # Max pairs per group for this day
     max_pairs_per_day: Optional[int] = 4

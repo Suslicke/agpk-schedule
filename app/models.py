@@ -65,6 +65,7 @@ class ScheduleItem(Base):
     weekly_hours = Column(Float, nullable=False)
     week_type = Column(String, default=WeekType.BALANCED.value, nullable=False)
     teacher_slots = Column(Integer, default=1, nullable=False)  # How many teachers needed (1, 2, 3...)
+    room_slots = Column(Integer, default=1, nullable=False)  # How many rooms needed (1, 2, 3...)
 
     group = relationship("Group", back_populates="schedule_items")
     subject = relationship("Subject", back_populates="schedule_items")
@@ -174,6 +175,7 @@ class DayScheduleEntry(Base):
     end_time = Column(String, nullable=False)
     status = Column(String, default="pending", nullable=False)  # pending/approved/replaced
     schedule_item_id = Column(Integer, ForeignKey("schedule_items.id"), nullable=True, index=True)
+    room_slots = Column(Integer, default=1, nullable=False)  # How many rooms needed (1, 2, 3...)
 
     day_schedule = relationship("DaySchedule", back_populates="entries")
     teacher_assignments = relationship("DayScheduleEntryTeacher", back_populates="entry", cascade="all, delete-orphan")
