@@ -507,7 +507,7 @@ def _assign_group_day_schedule(
         weekly_ah = item.weekly_hours
         hours = _distribute_hours(weekly_ah, item.week_type, is_even, pair_size_ah)
 
-        if hours <= 0 or remaining_hours.get(item.id, 0) <= 0:
+        if hours <= 0:
             continue
 
         # Try to assign one pair from this subject
@@ -582,7 +582,8 @@ def _assign_group_day_schedule(
             if len(assigned_slots) >= max_pairs:
                 break
 
-            if remaining_hours.get(item.id, 0) <= 0:
+            # Allow exceeding hours ONLY if we haven't reached min_pairs
+            if remaining_hours.get(item.id, 0) <= 0 and len(assigned_slots) >= min_pairs:
                 continue
 
             # Try to assign additional pairs from this subject
