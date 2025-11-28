@@ -741,43 +741,90 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
             for slot in dist.daily_schedule or []:
                 if slot.get("day") != dow:
                     continue
-                exists = (
-                    db.query(models.DayScheduleEntry)
-                    .filter(models.DayScheduleEntry.day_schedule_id == ds.id)
-                    .filter(models.DayScheduleEntry.group_id == item.group_id)
-                    .filter(models.DayScheduleEntry.start_time == slot["start_time"])  # per group per time
-                    .first()
-                )
-                if exists:
-                    debug_notes.append(
-                        f"Пропущено: у группы {db.query(models.Group).get(item.group_id).name} уже есть пара в {slot['start_time']}"
+
+                # Get all teachers for this schedule item
+                teachers = crud.get_schedule_item_teachers(item)
+                if not teachers:
+                    teachers = [db.query(models.Teacher).get(item.teacher_id)] if item.teacher_id else []
+
+                # Get all rooms for this schedule item (split by "/" if multiple)
+                room = db.query(models.Room).get(item.room_id)
+                room_names = []
+                if room and room.name:
+                    # Split room names by "/" (e.g., "ГК101/МК132" -> ["ГК101", "МК132"])
+                    room_names = [r.strip() for r in room.name.split('/') if r.strip()]
+
+                # Determine number of entries to create based on teacher_slots and room_slots
+                num_teachers = len(teachers) if teachers else 1
+                num_rooms = len(room_names) if room_names else 1
+
+                # For multi-teacher/multi-room subjects, we need to create separate entries
+                # Priority: if teacher_slots > 1 AND room_slots > 1, create one entry per combination
+                # Otherwise, create max(num_teachers, num_rooms) entries
+                entries_to_create = max(num_teachers, num_rooms)
+
+                for entry_idx in range(entries_to_create):
+                    # Check if group already has an entry at this time (only check once, not per split entry)
+                    if entry_idx == 0:
+                        exists = (
+                            db.query(models.DayScheduleEntry)
+                            .filter(models.DayScheduleEntry.day_schedule_id == ds.id)
+                            .filter(models.DayScheduleEntry.group_id == item.group_id)
+                            .filter(models.DayScheduleEntry.start_time == slot["start_time"])
+                            .first()
+                        )
+                        if exists:
+                            debug_notes.append(
+                                f"Пропущено: у группы {db.query(models.Group).get(item.group_id).name} уже есть пара в {slot['start_time']}"
+                            )
+                            break
+
+                    # Get teacher for this entry (cycle through teachers if needed)
+                    teacher = teachers[entry_idx % num_teachers] if teachers else None
+                    teacher_id = teacher.id if teacher else None
+
+                    # Get room for this entry (cycle through rooms if needed)
+                    room_name = room_names[entry_idx % num_rooms] if room_names else None
+                    if room_name:
+                        entry_room = db.query(models.Room).filter(models.Room.name == room_name).first()
+                        if not entry_room:
+                            entry_room = crud.get_or_create_room(db, room_name)
+                        room_id = entry_room.id
+                    else:
+                        room_id = item.room_id
+
+                    # Check teacher availability within this day's plan only (ignore weekly by default)
+                    if teacher_id and not _teacher_is_free(db, teacher_id, request.date, slot["start_time"], slot["end_time"], ignore_weekly=True):
+                        tname = teacher.name if teacher else "Unknown"
+                        debug_notes.append(
+                            f"Пропущено: преподаватель занят в дневном плане {tname} на {slot['start_time']}"
+                        )
+                        continue
+
+                    entry = models.DayScheduleEntry(
+                        day_schedule_id=ds.id,
+                        group_id=item.group_id,
+                        subject_id=item.subject_id,
+                        teacher_id=teacher_id,
+                        room_id=room_id,
+                        start_time=slot["start_time"],
+                        end_time=slot["end_time"],
+                        status="pending",
+                        schedule_item_id=item.id,
                     )
-                    continue
-                # Check teacher availability within this day's plan only (ignore weekly by default)
-                if not _teacher_is_free(db, item.teacher_id, request.date, slot["start_time"], slot["end_time"], ignore_weekly=True):
-                    tname = db.query(models.Teacher).get(item.teacher_id).name
+                    db.add(entry)
+                    teacher_name_str = teacher.name if teacher else "Unknown"
+                    room_name_str = db.query(models.Room).get(room_id).name if room_id else "Unknown"
                     debug_notes.append(
-                        f"Пропущено: преподаватель занят в дневном плане {tname} на {slot['start_time']}"
+                        f"Добавлено из недельного плана: {db.query(models.Group).get(item.group_id).name} — {db.query(models.Subject).get(item.subject_id).name} ({teacher_name_str}) {room_name_str} {slot['start_time']}-{slot['end_time']}"
                     )
-                    continue
-                entry = models.DayScheduleEntry(
-                    day_schedule_id=ds.id,
-                    group_id=item.group_id,
-                    subject_id=item.subject_id,
-                    teacher_id=item.teacher_id,
-                    room_id=item.room_id,
-                    start_time=slot["start_time"],
-                    end_time=slot["end_time"],
-                    status="pending",
-                    schedule_item_id=item.id,
-                )
-                db.add(entry)
-                debug_notes.append(
-                    f"Добавлено из недельного плана: {db.query(models.Group).get(item.group_id).name} — {db.query(models.Subject).get(item.subject_id).name} ({db.query(models.Teacher).get(item.teacher_id).name}) {db.query(models.Room).get(item.room_id).name} {slot['start_time']}-{slot['end_time']}"
-                )
         db.commit()
         # enforce_no_gaps logic (as in crud)
+        # IMPORTANT: Only apply cap if respect_weekly_plan is False
+        # When respect_weekly_plan is True (default), preserve ALL pairs from weekly plan even if > cap
         cap = request.max_pairs_per_day or 0
+        respect_plan = request.respect_weekly_plan if request.respect_weekly_plan is not None else True
+
         if bool(request.enforce_no_gaps):
             group_ids = (
                 {gid for (gid,) in db.query(models.DayScheduleEntry.group_id).filter(models.DayScheduleEntry.day_schedule_id == ds.id).distinct()}
@@ -788,6 +835,11 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
                 entries = q.all()
                 if not entries:
                     continue
+
+                # Count how many entries came from weekly plan (have schedule_item_id)
+                plan_entries = [e for e in entries if e.schedule_item_id is not None]
+                num_from_plan = len(plan_entries)
+
                 slots = _get_time_slots_for_group(db.query(models.Group).get(gid).name, enable_shifts=True)
                 index_by_start = {s["start"]: i for i, s in enumerate(slots)}
                 ordered = sorted(entries, key=lambda e: e.start_time)
@@ -802,9 +854,25 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
                         last_idx = idx
                     else:
                         break
-                # Apply cap if needed
-                if cap > 0 and len(keep_seq) > cap:
+
+                # Apply cap ONLY if:
+                # 1. cap > 0 is set
+                # 2. AND respect_weekly_plan is False
+                # 3. OR if all entries are NOT from weekly plan
+                # This preserves all pairs from weekly plan when respect_weekly_plan=True (default)
+                should_apply_cap = cap > 0 and (not respect_plan or num_from_plan == 0)
+
+                if should_apply_cap and len(keep_seq) > cap:
+                    debug_notes.append(
+                        f"Применен cap={cap} для группы {db.query(models.Group).get(gid).name}: было {len(keep_seq)} пар, оставлено {cap}"
+                    )
                     keep_seq = keep_seq[:cap]
+                elif cap > 0 and len(keep_seq) > cap:
+                    # Cap exceeded but not applied due to respect_weekly_plan=True
+                    debug_notes.append(
+                        f"Cap={cap} НЕ применен для группы {db.query(models.Group).get(gid).name}: {len(keep_seq)} пар из плана сохранены (respect_weekly_plan=True)"
+                    )
+
                 # Delete everything not in keep_seq
                 keep_ids = {e.id for e in keep_seq}
                 for e in entries:

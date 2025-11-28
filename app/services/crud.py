@@ -1436,66 +1436,95 @@ def plan_day_schedule(db: Session, request: schemas.DayPlanCreateRequest) -> mod
             for slot in dist.daily_schedule or []:
                 if slot.get("day") != dow:
                     continue
-                # Avoid duplicates
-                exists = (
-                    db.query(models.DayScheduleEntry)
-                    .filter(models.DayScheduleEntry.day_schedule_id == ds.id)
-                    .filter(models.DayScheduleEntry.group_id == item.group_id)
-                    .filter(models.DayScheduleEntry.start_time == slot["start_time"])  # per group per start time
-                    .first()
-                )
-                if exists:
-                    debug_notes.append(
-                        f"Пропущено: у группы {db.query(models.Group).get(item.group_id).name} уже есть пара в {slot['start_time']}"
-                    )
-                    continue
+
                 # Get all teachers for this item (supports multiple teachers per subject)
                 teachers = get_schedule_item_teachers(item)
+                if not teachers:
+                    teachers = [db.query(models.Teacher).get(item.teacher_id)] if item.teacher_id else []
 
-                # Check ALL teachers' availability
-                all_teachers_free = True
-                busy_teachers = []
-                for teacher in teachers:
-                    if not _teacher_is_free(db, teacher.id, request.date, slot["start_time"], slot["end_time"], ignore_weekly=True):
-                        all_teachers_free = False
-                        busy_teachers.append(teacher.name)
+                # Get all rooms for this schedule item (split by "/" if multiple)
+                room = db.query(models.Room).get(item.room_id)
+                room_names = []
+                if room and room.name:
+                    # Split room names by "/" (e.g., "ГК101/МК132" -> ["ГК101", "МК132"])
+                    room_names = [r.strip() for r in room.name.split('/') if r.strip()]
 
-                if not all_teachers_free:
+                # Determine number of entries to create
+                num_rooms = len(room_names) if room_names else 1
+
+                # For multi-room subjects, we need to create separate entries for each room
+                for room_idx in range(num_rooms):
+                    # Check if group already has an entry at this time (only check once, not per split entry)
+                    if room_idx == 0:
+                        exists = (
+                            db.query(models.DayScheduleEntry)
+                            .filter(models.DayScheduleEntry.day_schedule_id == ds.id)
+                            .filter(models.DayScheduleEntry.group_id == item.group_id)
+                            .filter(models.DayScheduleEntry.start_time == slot["start_time"])  # per group per start time
+                            .first()
+                        )
+                        if exists:
+                            debug_notes.append(
+                                f"Пропущено: у группы {db.query(models.Group).get(item.group_id).name} уже есть пара в {slot['start_time']}"
+                            )
+                            break
+
+                    # Check ALL teachers' availability (only once, not per room)
+                    if room_idx == 0:
+                        all_teachers_free = True
+                        busy_teachers = []
+                        for teacher in teachers:
+                            if not _teacher_is_free(db, teacher.id, request.date, slot["start_time"], slot["end_time"], ignore_weekly=True):
+                                all_teachers_free = False
+                                busy_teachers.append(teacher.name)
+
+                        if not all_teachers_free:
+                            debug_notes.append(
+                                f"Пропущено: преподаватели заняты в дневном плане: {', '.join(busy_teachers)} на {slot['start_time']}"
+                            )
+                            break
+
+                    # Get room for this entry
+                    room_name = room_names[room_idx] if room_names else None
+                    if room_name:
+                        entry_room = db.query(models.Room).filter(models.Room.name == room_name).first()
+                        if not entry_room:
+                            entry_room = get_or_create_room(db, room_name)
+                        room_id = entry_room.id
+                    else:
+                        room_id = item.room_id
+
+                    # Create entry with primary teacher
+                    entry = models.DayScheduleEntry(
+                        day_schedule_id=ds.id,
+                        group_id=item.group_id,
+                        subject_id=item.subject_id,
+                        teacher_id=teachers[0].id if teachers else None,  # Primary teacher
+                        room_id=room_id,
+                        start_time=slot["start_time"],
+                        end_time=slot["end_time"],
+                        status="pending",
+                        schedule_item_id=item.id,
+                        room_slots=item.room_slots if hasattr(item, 'room_slots') else 1,
+                    )
+                    db.add(entry)
+                    db.flush()  # Get entry.id
+
+                    # Create teacher assignments for ALL teachers
+                    for idx, teacher in enumerate(teachers):
+                        teacher_assignment = models.DayScheduleEntryTeacher(
+                            entry_id=entry.id,
+                            teacher_id=teacher.id,
+                            slot_number=idx + 1,
+                            is_primary=(idx == 0)
+                        )
+                        db.add(teacher_assignment)
+
+                    teacher_names = "/".join([t.name for t in teachers])
+                    room_name_str = db.query(models.Room).get(room_id).name if room_id else "Unknown"
                     debug_notes.append(
-                        f"Пропущено: преподаватели заняты в дневном плане: {', '.join(busy_teachers)} на {slot['start_time']}"
+                        f"Добавлено из недельного плана: {db.query(models.Group).get(item.group_id).name} — {db.query(models.Subject).get(item.subject_id).name} ({teacher_names}) {room_name_str} {slot['start_time']}-{slot['end_time']}"
                     )
-                    continue
-
-                # Create entry with primary teacher
-                entry = models.DayScheduleEntry(
-                    day_schedule_id=ds.id,
-                    group_id=item.group_id,
-                    subject_id=item.subject_id,
-                    teacher_id=teachers[0].id if teachers else None,  # Primary teacher
-                    room_id=item.room_id,
-                    start_time=slot["start_time"],
-                    end_time=slot["end_time"],
-                    status="pending",
-                    schedule_item_id=item.id,
-                    room_slots=item.room_slots if hasattr(item, 'room_slots') else 1,
-                )
-                db.add(entry)
-                db.flush()  # Get entry.id
-
-                # Create teacher assignments for ALL teachers
-                for idx, teacher in enumerate(teachers):
-                    teacher_assignment = models.DayScheduleEntryTeacher(
-                        entry_id=entry.id,
-                        teacher_id=teacher.id,
-                        slot_number=idx + 1,
-                        is_primary=(idx == 0)
-                    )
-                    db.add(teacher_assignment)
-
-                teacher_names = "/".join([t.name for t in teachers])
-                debug_notes.append(
-                    f"Добавлено из недельного плана: {db.query(models.Group).get(item.group_id).name} — {db.query(models.Subject).get(item.subject_id).name} ({teacher_names}) {db.query(models.Room).get(item.room_id).name} {slot['start_time']}-{slot['end_time']}"
-                )
         db.commit()
         # Enforce no-gaps and optional cap for every group present in the day (or only target groups if set)
         cap = request.max_pairs_per_day or 0
