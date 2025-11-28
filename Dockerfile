@@ -32,4 +32,4 @@ COPY . .
 EXPOSE 8000
 
 # Use PATH-resolved gunicorn from /app/.venv/bin
-CMD ["gunicorn", "app.main:app", "--workers", "4", "--bind", "0.0.0.0:8000", "-k", "uvicorn.workers.UvicornWorker"]
+CMD ["gunicorn", "app.main:app", "--workers", "1", "--bind", "0.0.0.0:8000", "-k", "uvicorn.workers.UvicornWorker"]
